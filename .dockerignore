@@ -1,0 +1,12 @@
+# Mirrors .gitignore — never bake local state or secrets into the image.
+node_modules/
+.env
+*.db
+*.db-shm
+*.db-wal
+.git
+.gitignore
+
+# Build metadata that has no place in the runtime image.
+Dockerfile
+.dockerignore

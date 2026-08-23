@@ -82,16 +82,18 @@ ngrok http 3000
 # เอา URL ที่ได้ไปตั้งเป็น Webhook URL: https://xxxx.ngrok-free.app/webhook
 ```
 
-> ⚠️ `better-sqlite3` เป็น native module — ถ้าเจอ build error ตอน `npm install` ให้เช็กว่า Node เป็นเวอร์ชันที่มี prebuilt binary (ทดสอบผ่านบน Node 26 ด้วย better-sqlite3 v13)
+> ⚠️ `better-sqlite3` เป็น native module ที่ **ต้องการ Node ≥22** (`package.json` บังคับด้วย `engines.node`) — เวอร์ชันต่ำกว่านี้จะติดตั้งได้แบบ silent-fail (npm แค่เตือน ไม่ error) แล้วไปพังตอนรันจริงแบบไม่มี stack trace (เจอเคสนี้ตอน deploy จริงบน Railway ที่ auto-detect เลือก Node ผิดเวอร์ชัน) ทดสอบผ่านบน Node 22/26 ด้วย better-sqlite3 v13
 
 ## Deploy ขึ้น Railway
+
+**สำคัญ:** repo นี้มี `Dockerfile` ที่ pin Node 22 ไว้ตรงๆ เพื่อเลี่ยงปัญหาข้างบน — ต้องตั้งให้ Railway ใช้ Dockerfile แทนการ auto-detect (Nixpacks) ไม่งั้นจะกลับไปเจอ segfault เดิม
 
 1. **push โค้ดขึ้น GitHub** (ไม่ต้องกลัว `.env` หลุด — ถูก ignore แล้ว)
    ```bash
    git add . && git commit -m "LINE reminder bot MVP" && git push
    ```
 2. **สร้าง project** ที่ [railway.app](https://railway.app) → *New Project* → *Deploy from GitHub repo* → เลือก repo นี้
-   Railway ตรวจเจอ Node เอง และใช้ `npm start` จาก `package.json`
+   จากนั้นเข้า **Settings → Build** → เปลี่ยน **Builder** จาก Nixpacks เป็น **Dockerfile** (ระบุ path `Dockerfile` ที่ root ของ repo)
 3. **ตั้ง Variables** (แท็บ *Variables* ของ service):
    ```
    LINE_CHANNEL_ACCESS_TOKEN=...
