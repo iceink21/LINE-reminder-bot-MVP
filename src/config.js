@@ -22,11 +22,12 @@ const config = {
     channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || '',
     channelSecret: process.env.LINE_CHANNEL_SECRET || '',
   },
+  // Fallback provider, used whenever the primary parse fails for any reason.
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
     model: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
   },
-  // Fallback provider, used only when Gemini is exhausted by rate limiting.
+  // Primary provider.
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY || '',
     model: process.env.OPENROUTER_MODEL || 'stealth/ox-alpha',
@@ -45,14 +46,14 @@ function assertConfig() {
   if (missing.length) {
     throw new Error(`Missing required env vars: ${missing.join(', ')}`);
   }
-  if (!config.gemini.apiKey || config.gemini.apiKey.startsWith('REPLACE_ME')) {
+  if (!config.openrouter.apiKey || config.openrouter.apiKey.startsWith('REPLACE_ME')) {
     console.warn(
-      '[config] GEMINI_API_KEY is not set to a real key — natural-language parsing will fail until you fill it in.'
+      '[config] OPENROUTER_API_KEY is not set to a real key — natural-language parsing will fail until you fill it in.'
     );
   }
-  if (!config.openrouter.apiKey) {
+  if (!config.gemini.apiKey || config.gemini.apiKey.startsWith('REPLACE_ME')) {
     console.warn(
-      '[config] OPENROUTER_API_KEY is not set — the rate-limit fallback is disabled; Gemini 429s will fail the parse.'
+      '[config] GEMINI_API_KEY is not set to a real key — the fallback is disabled; any Ox Alpha failure will fail the parse.'
     );
   }
 }

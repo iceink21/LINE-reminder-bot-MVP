@@ -132,6 +132,8 @@ const parseFailText = (code) => {
   if (code === 'no_api_key') {
     return text('ตอนนี้ระบบอ่านข้อความยังไม่พร้อมใช้งาน (ยังไม่ได้ตั้งค่า API key) 🙏\nลองใหม่อีกทีทีหลังนะ');
   }
+  // Reachable from either provider now that Ox Alpha is primary and Gemini is
+  // the fallback — the wording stays deliberately provider-agnostic.
   if (code === 'http_429') {
     return text('ตอนนี้ตัวช่วยอ่านข้อความคิวแน่นไปหน่อย 🚦\nรอสักครู่แล้วส่งข้อความเดิมมาใหม่นะ');
   }

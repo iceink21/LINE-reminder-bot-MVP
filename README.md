@@ -1,12 +1,12 @@
 # LINE Reminder Bot
 
-บอทเตือนความจำส่วนตัวบน LINE Official Account — พิมพ์งานเป็นภาษาไทยธรรมดา บอทใช้ Gemini แปลงเป็นงาน + กำหนดส่ง แล้วส่ง Flex ให้กดยืนยัน ก่อนเก็บลง SQLite และเตือนกลับมาเองเมื่อใกล้ถึงกำหนด
+บอทเตือนความจำส่วนตัวบน LINE Official Account — พิมพ์งานเป็นภาษาไทยธรรมดา บอทใช้ Ox Alpha (มี Gemini เป็น fallback) แปลงเป็นงาน + กำหนดส่ง แล้วส่ง Flex ให้กดยืนยัน ก่อนเก็บลง SQLite และเตือนกลับมาเองเมื่อใกล้ถึงกำหนด
 
 ## ทำอะไรได้บ้าง
 
 | อินพุต | ผลลัพธ์ |
 |---|---|
-| ข้อความอิสระ เช่น `ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง` | Gemini แยกเป็น `{title, deadline_iso, category}` → Flex ยืนยัน/ยกเลิก → กด "ยืนยัน" แล้วบันทึก |
+| ข้อความอิสระ เช่น `ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง` | โมเดลแยกเป็น `{title, deadline_iso, category}` → Flex ยืนยัน/ยกเลิก → กด "ยืนยัน" แล้วบันทึก |
 | `/list` | รายการงานที่ยัง `pending` เรียงตามใกล้ถึงกำหนดก่อน |
 | `/done <id>` | ปิดงาน (เฉพาะงานของตัวเอง) |
 | `/delete <id>` | ลบงาน (เฉพาะงานของตัวเอง) |
@@ -22,7 +22,7 @@
 src/
   index.js      Express app, /webhook (มี LINE signature middleware) + /health, บูต scheduler
   webhook.js    routing ของ event: command / free text / postback / follow
-  gemini.js     เรียก Gemini REST แบบ JSON-only + normalize ผลลัพธ์
+  gemini.js     เรียก Ox Alpha (หลัก) / Gemini (fallback) แบบ JSON-only + normalize ผลลัพธ์
   db.js         better-sqlite3: schema + prepared statement (scope ด้วย line_user_id ทุกคำสั่ง)
   scheduler.js  node-cron: sweep ทุกนาที + สรุปประจำวัน 06:00 + ล้าง draft ค้างวันละครั้ง
   messages.js   ข้อความ/Flex ภาษาไทยทั้งหมด
@@ -52,12 +52,12 @@ src/
 |---|---|---|
 | `LINE_CHANNEL_ACCESS_TOKEN` | ✅ | จาก LINE Developers Console → Messaging API |
 | `LINE_CHANNEL_SECRET` | ✅ | ใช้ตรวจ `x-line-signature` |
-| `GEMINI_API_KEY` | ✅ | จาก Google AI Studio |
+| `OPENROUTER_API_KEY` | ✅ | ตัวแยกวิเคราะห์หลัก (Ox Alpha) จาก openrouter.ai |
 | `DATABASE_URL` | — | `file:./dev.db` (รองรับทั้ง `file:` prefix และ path เปล่า) |
 | `PORT` | — | `3000` |
-| `GEMINI_MODEL` | — | `gemini-3.6-flash` |
-| `OPENROUTER_API_KEY` | — | ใช้เป็น fallback เฉพาะตอน Gemini ติด rate limit (429) เท่านั้น; ไม่ใส่ = ปิด fallback |
 | `OPENROUTER_MODEL` | — | `stealth/ox-alpha` |
+| `GEMINI_API_KEY` | — | จาก Google AI Studio; ใช้เป็น fallback ทุกครั้งที่ Ox Alpha พลาด (429/4xx/5xx/เน็ตหลุด/JSON เสีย); ไม่ใส่ = ปิด fallback |
+| `GEMINI_MODEL` | — | `gemini-3.6-flash` |
 | `TZ_NAME` | — | `Asia/Bangkok` |
 
 `.env` ไม่ถูก commit (มีอยู่ใน `.gitignore` แล้ว) — อย่าใส่ค่าจริงลง repo
@@ -100,6 +100,7 @@ ngrok http 3000
    ```
    LINE_CHANNEL_ACCESS_TOKEN=...
    LINE_CHANNEL_SECRET=...
+   OPENROUTER_API_KEY=...
    GEMINI_API_KEY=...
    DATABASE_URL=file:/data/dev.db
    TZ_NAME=Asia/Bangkok

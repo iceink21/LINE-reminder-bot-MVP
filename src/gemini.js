@@ -3,9 +3,9 @@
 const { config } = require('./config');
 const { nowLocalIso, thaiWeekday, toUtcIso } = require('./datetime');
 
+// Fallback provider — see parseReminder().
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
-// Fallback provider: OpenAI-compatible chat/completions. Only used when Gemini
-// has burned through its 429 retries — see parseReminder().
+// Primary provider: OpenAI-compatible chat/completions (Ox Alpha).
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 // gemini-3.6-flash is a thinking model: even a one-line parse burns a few hundred
 // thinking tokens, and measured round-trips ranged 11.5-22.6s. Thinking cannot be
@@ -114,8 +114,8 @@ function finalizeResult(rawText, provider) {
 
 /**
  * Call Gemini and return the raw response text.
- * Throws ParseError('http_429') once the 429 retries are exhausted — that is the
- * one failure the caller is allowed to treat as "try the fallback provider".
+ * Now the fallback leg: reached only after Ox Alpha has already failed, so any
+ * ParseError thrown here is terminal and surfaces to the user.
  */
 async function callGemini(prompt) {
   const url = API_BASE + encodeURIComponent(config.gemini.model) + ':generateContent';
@@ -173,8 +173,9 @@ async function callGemini(prompt) {
 
 /**
  * Call OpenRouter (OpenAI-compatible) and return the raw response text.
- * Ox Alpha has no structured-output schema, so JSON-ness rests on the same
- * SYSTEM_RULES instructions plus response_format, with extractJson() as a net.
+ * This is the primary leg. Ox Alpha has no structured-output schema, so
+ * JSON-ness rests on the same SYSTEM_RULES instructions plus response_format,
+ * with extractJson() as a net — and, failing that, the Gemini fallback.
  */
 async function callOpenRouter(prompt) {
   const body = {
@@ -219,39 +220,50 @@ async function callOpenRouter(prompt) {
 
 /**
  * Parse a free-form Thai message into { title, deadlineIso (UTC), category }.
- * Gemini is primary. If — and only if — Gemini is still rate-limited after its
- * retries, the same prompt is re-run through OpenRouter/Ox Alpha. Every other
- * Gemini failure (network, bad JSON, low confidence) fails exactly as before:
- * Ox Alpha is a stealth/preview model and must not become a silent default.
+ * Ox Alpha is primary, Gemini is the fallback. Unlike the previous arrangement,
+ * the fallback trigger is deliberately broad: Ox Alpha is an anonymous
+ * stealth/preview model with no published rate limits or documented failure
+ * modes, so we cannot assume it only fails as a 429. ANY ParseError out of the
+ * Ox Alpha leg — 429, other 4xx/5xx, network, unusable JSON — re-runs the same
+ * prompt through Gemini, which at least has a response schema to lean on.
+ * The two exceptions:
+ *   - a missing OPENROUTER_API_KEY is a config problem Gemini cannot fix, so it
+ *     surfaces directly (guard clause below, outside the try);
+ *   - 'low_confidence' is a verdict about the user's text, not a provider
+ *     failure — a second opinion would just double the cost of every chit-chat
+ *     message, so it surfaces as-is.
  * Throws ParseError on anything the caller should answer with a Thai retry message.
  */
 async function parseReminder(userText, now = new Date()) {
-  if (!config.gemini.apiKey || config.gemini.apiKey.startsWith('REPLACE_ME')) {
-    throw new ParseError('GEMINI_API_KEY is not configured', 'no_api_key');
+  if (!config.openrouter.apiKey || config.openrouter.apiKey.startsWith('REPLACE_ME')) {
+    throw new ParseError('OPENROUTER_API_KEY is not configured', 'no_api_key');
   }
 
   const prompt = buildPrompt(userText, now);
 
-  let text;
   try {
-    text = await callGemini(prompt);
+    // finalizeResult sits inside the try on purpose: unusable JSON from Ox Alpha
+    // is exactly the kind of failure the fallback exists to absorb.
+    const result = finalizeResult(await callOpenRouter(prompt), config.openrouter.model);
+    console.info('[parseReminder] served by ox-alpha (primary) (' + config.openrouter.model + ')');
+    return result;
   } catch (err) {
-    const rateLimited = err instanceof ParseError && err.code === 'http_429';
-    if (!rateLimited) throw err;
-    if (!config.openrouter.apiKey) {
-      console.warn('[parseReminder] gemini rate-limited and no OPENROUTER_API_KEY — giving up');
+    const recoverable = err instanceof ParseError && err.code !== 'low_confidence';
+    if (!recoverable) throw err;
+    if (!config.gemini.apiKey || config.gemini.apiKey.startsWith('REPLACE_ME')) {
+      console.warn(
+        '[parseReminder] ox-alpha failed (' + err.code + ') and no GEMINI_API_KEY — giving up'
+      );
       throw err;
     }
-    console.warn('[parseReminder] gemini rate-limited, falling back to ' + config.openrouter.model);
-    const fallbackText = await callOpenRouter(prompt);
-    const result = finalizeResult(fallbackText, config.openrouter.model);
-    console.info('[parseReminder] served by ox-alpha fallback (' + config.openrouter.model + ')');
+    console.warn(
+      '[parseReminder] ox-alpha failed (' + err.code + '), falling back to ' + config.gemini.model
+    );
+    const fallbackText = await callGemini(prompt);
+    const result = finalizeResult(fallbackText, config.gemini.model);
+    console.debug('[parseReminder] served by gemini fallback (' + config.gemini.model + ')');
     return result;
   }
-
-  const result = finalizeResult(text, 'gemini');
-  console.debug('[parseReminder] served by gemini (' + config.gemini.model + ')');
-  return result;
 }
 
 module.exports = { parseReminder, ParseError };
