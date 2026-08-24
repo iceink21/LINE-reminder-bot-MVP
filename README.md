@@ -56,6 +56,8 @@ src/
 | `DATABASE_URL` | — | `file:./dev.db` (รองรับทั้ง `file:` prefix และ path เปล่า) |
 | `PORT` | — | `3000` |
 | `GEMINI_MODEL` | — | `gemini-3.6-flash` |
+| `OPENROUTER_API_KEY` | — | ใช้เป็น fallback เฉพาะตอน Gemini ติด rate limit (429) เท่านั้น; ไม่ใส่ = ปิด fallback |
+| `OPENROUTER_MODEL` | — | `stealth/ox-alpha` |
 | `TZ_NAME` | — | `Asia/Bangkok` |
 
 `.env` ไม่ถูก commit (มีอยู่ใน `.gitignore` แล้ว) — อย่าใส่ค่าจริงลง repo
