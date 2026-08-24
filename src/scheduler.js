@@ -9,14 +9,14 @@ const { config } = require('./config');
 let running = false;
 
 /**
- * One sweep: fire day-before pings, then due pings.
+ * One sweep: fire day-before pings, then hour-before pings, then due pings.
  * Each row is flagged only after its push succeeds, so a transient LINE error
  * retries on the next tick instead of silently dropping the reminder.
  */
 async function tick(now = new Date()) {
   if (running) return { skipped: true };
   running = true;
-  const result = { dayBefore: 0, due: 0, failed: 0 };
+  const result = { dayBefore: 0, hourBefore: 0, due: 0, failed: 0 };
 
   try {
     for (const row of store.findDueDayBefore(now)) {
@@ -27,6 +27,17 @@ async function tick(now = new Date()) {
       } catch (err) {
         result.failed += 1;
         console.error('[scheduler] day-before push failed for #' + row.id + ':', err && err.message);
+      }
+    }
+
+    for (const row of store.findDueHourBefore(now)) {
+      try {
+        await push(row.line_user_id, msg.hourBeforePush(row));
+        store.flagHourBeforeNotified(row.id);
+        result.hourBefore += 1;
+      } catch (err) {
+        result.failed += 1;
+        console.error('[scheduler] hour-before push failed for #' + row.id + ':', err && err.message);
       }
     }
 

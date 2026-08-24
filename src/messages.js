@@ -105,7 +105,7 @@ function listText(rows) {
 
 const savedText = (r) =>
   text('บันทึกแล้ว ✅\n#' + r.id + ' ' + r.title + '\nกำหนด ' + formatThai(r.deadline_iso) +
-    '\nเดี๋ยวเตือนล่วงหน้า 1 วัน และเตือนอีกทีตอนถึงกำหนด');
+    '\nเดี๋ยวเตือนล่วงหน้า 1 วัน, เตือนอีกที 1 ชั่วโมงก่อนถึงกำหนด และเตือนตอนถึงกำหนดจริง');
 
 const cancelledText = () => text('ยกเลิกให้แล้ว ไม่ได้บันทึกอะไรไว้ 👌\nลองพิมพ์ใหม่อีกทีได้เลย');
 
@@ -158,6 +158,9 @@ const errorText = () =>
 const dayBeforePush = (r) =>
   text('⏰ เตือนล่วงหน้า 1 วัน\n#' + r.id + ' ' + r.title + '\nถึงกำหนด ' + formatThai(r.deadline_iso));
 
+const hourBeforePush = (r) =>
+  text('⏰ เตือนล่วงหน้า 1 ชั่วโมง\n#' + r.id + ' ' + r.title + '\nถึงกำหนด ' + formatThai(r.deadline_iso));
+
 // A morning digest is a courtesy, not an inbox dump — past this many items the
 // list stops being readable on a phone, so we point at /list instead.
 const DIGEST_MAX_ITEMS = 15;
@@ -203,6 +206,7 @@ module.exports = {
   parseFailText,
   errorText,
   dayBeforePush,
+  hourBeforePush,
   duePush,
   digestPush,
 };

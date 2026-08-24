@@ -21,9 +21,10 @@ const SCHEMA_SQL = [
   '  category            TEXT,',
   // status: draft | pending | done
   "  status              TEXT    NOT NULL DEFAULT 'draft',",
-  '  day_before_notified INTEGER NOT NULL DEFAULT 0,',
-  '  due_notified        INTEGER NOT NULL DEFAULT 0,',
-  '  created_at          TEXT    NOT NULL',
+  '  day_before_notified  INTEGER NOT NULL DEFAULT 0,',
+  '  hour_before_notified INTEGER NOT NULL DEFAULT 0,',
+  '  due_notified         INTEGER NOT NULL DEFAULT 0,',
+  '  created_at           TEXT    NOT NULL',
   ');',
   'CREATE INDEX IF NOT EXISTS idx_reminders_user_status',
   '  ON reminders (line_user_id, status, deadline_iso);',
@@ -32,6 +33,16 @@ const SCHEMA_SQL = [
 ].join('\n');
 
 db.exec(SCHEMA_SQL);
+
+// Migration: `dev.db` may predate the hour_before_notified column, and SQLite
+// has no `ADD COLUMN IF NOT EXISTS`, so check table_info before altering.
+const hasHourBeforeColumn = db
+  .prepare('PRAGMA table_info(reminders)')
+  .all()
+  .some((col) => col.name === 'hour_before_notified');
+if (!hasHourBeforeColumn) {
+  db.prepare('ALTER TABLE reminders ADD COLUMN hour_before_notified INTEGER NOT NULL DEFAULT 0').run();
+}
 
 // --- prepared statements: every user-facing query is scoped by line_user_id ---
 const SQL = {
@@ -60,8 +71,14 @@ const SQL = {
     "SELECT * FROM reminders WHERE status = 'pending' " +
     'AND day_before_notified = 0 AND due_notified = 0 ' +
     'AND deadline_iso <= ? AND deadline_iso > ?',
+  // params: upper bound (now + 1h), lower bound (now + 1h - window)
+  dueHourBefore:
+    "SELECT * FROM reminders WHERE status = 'pending' " +
+    'AND hour_before_notified = 0 AND due_notified = 0 ' +
+    'AND deadline_iso <= ? AND deadline_iso > ?',
   flagDue: 'UPDATE reminders SET due_notified = 1 WHERE id = ?',
   flagDayBefore: 'UPDATE reminders SET day_before_notified = 1 WHERE id = ?',
+  flagHourBefore: 'UPDATE reminders SET hour_before_notified = 1 WHERE id = ?',
   purgeStaleDrafts: "DELETE FROM reminders WHERE status = 'draft' AND created_at < ?",
 };
 
@@ -126,8 +143,27 @@ function findDueDayBefore(now = new Date(), windowMs = 60 * 60 * 1000) {
   );
 }
 
+const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * Reminders that are genuinely ~1 hour out, i.e. sitting inside the band
+ * (now + 1h - windowMs, now + 1h]. Unlike `findDueDayBefore`, the target
+ * precision here IS the window (1 hour), so a generous 1h band would make the
+ * notification arrive anywhere from "due now" to "2 hours out" — a tight
+ * 10-minute band keeps it honestly "about 1 hour before" while still giving
+ * enough slack for a restart or a missed cron tick.
+ */
+function findDueHourBefore(now = new Date(), windowMs = 10 * 60 * 1000) {
+  const upper = now.getTime() + HOUR_MS;
+  return stmt.dueHourBefore.all(
+    new Date(upper).toISOString(),
+    new Date(upper - windowMs).toISOString()
+  );
+}
+
 const flagDueNotified = (id) => stmt.flagDue.run(id);
 const flagDayBeforeNotified = (id) => stmt.flagDayBefore.run(id);
+const flagHourBeforeNotified = (id) => stmt.flagHourBefore.run(id);
 
 /** Drafts the user never confirmed are dead weight — drop them after a day. */
 function purgeStaleDrafts(olderThanMs = 24 * 60 * 60 * 1000) {
@@ -147,7 +183,9 @@ module.exports = {
   listPendingUserIds,
   findDueNow,
   findDueDayBefore,
+  findDueHourBefore,
   flagDueNotified,
   flagDayBeforeNotified,
+  flagHourBeforeNotified,
   purgeStaleDrafts,
 };
