@@ -26,6 +26,11 @@ const config = {
     apiKey: process.env.GEMINI_API_KEY || '',
     model: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
   },
+  // Fallback provider, used only when Gemini is exhausted by rate limiting.
+  openrouter: {
+    apiKey: process.env.OPENROUTER_API_KEY || '',
+    model: process.env.OPENROUTER_MODEL || 'stealth/ox-alpha',
+  },
   dbPath: resolveDbPath(process.env.DATABASE_URL),
   // All user-facing date handling is done in Thai local time.
   timezone: process.env.TZ_NAME || 'Asia/Bangkok',
@@ -43,6 +48,11 @@ function assertConfig() {
   if (!config.gemini.apiKey || config.gemini.apiKey.startsWith('REPLACE_ME')) {
     console.warn(
       '[config] GEMINI_API_KEY is not set to a real key — natural-language parsing will fail until you fill it in.'
+    );
+  }
+  if (!config.openrouter.apiKey) {
+    console.warn(
+      '[config] OPENROUTER_API_KEY is not set — the rate-limit fallback is disabled; Gemini 429s will fail the parse.'
     );
   }
 }
