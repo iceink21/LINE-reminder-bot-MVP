@@ -5,6 +5,7 @@ const store = require('./db');
 const msg = require('./messages');
 const { push } = require('./line');
 const { config } = require('./config');
+const { parseReminder, summarizeChitChat, ParseError } = require('./gemini');
 
 let running = false;
 
@@ -96,6 +97,100 @@ async function digestTick() {
   return result;
 }
 
+let classifyRunning = false;
+
+/**
+ * Sort one user's parked messages into reminders and chit-chat.
+ * Anything the parser rejects — including 'low_confidence' — is treated as
+ * chatter rather than as an error: the whole point of batching is that the user
+ * never had to phrase a message as a command in the first place.
+ */
+async function classifyUser(lineUserId) {
+  const rows = store.listUnprocessedForUser(lineUserId);
+  const created = [];
+  const chitChat = [];
+
+  for (const row of rows) {
+    try {
+      // The message's OWN timestamp, so "พรุ่งนี้" resolves against when it was
+      // sent — not against the midnight the classifier happens to run at.
+      const parsed = await parseReminder(row.text, new Date(row.created_at));
+      const id = store.createPendingReminder({
+        lineUserId,
+        title: parsed.title,
+        deadlineIso: parsed.deadlineIso,
+        category: parsed.category,
+      });
+      created.push({ id, title: parsed.title, deadline_iso: parsed.deadlineIso });
+    } catch (err) {
+      if (!(err instanceof ParseError)) throw err;
+      chitChat.push(row.text);
+    }
+  }
+
+  return { rows, created, chitChat };
+}
+
+/**
+ * Nightly 00:00 sweep: classify everything parked since the last run, then send
+ * each user ONE push with the reminders that were created and a recap of the
+ * rest. One push per user per day is what keeps this inside the monthly quota.
+ *
+ * Rows are marked processed even when the push fails — re-parsing them the next
+ * night would double-insert every reminder, which is worse than a missed digest.
+ */
+async function classifyTick(now = new Date()) {
+  if (classifyRunning) return { skipped: true };
+  classifyRunning = true;
+  const result = { users: 0, reminders: 0, chitChat: 0, sent: 0, failed: 0 };
+
+  try {
+    for (const lineUserId of store.listUnprocessedByUser()) {
+      result.users += 1;
+      let batch;
+      try {
+        batch = await classifyUser(lineUserId);
+      } catch (err) {
+        result.failed += 1;
+        console.error('[scheduler] classify failed for a user:', err && err.message);
+        continue;
+      }
+
+      store.markInboxProcessed(batch.rows.map((r) => r.id));
+      result.reminders += batch.created.length;
+      result.chitChat += batch.chitChat.length;
+
+      let summary = null;
+      if (batch.chitChat.length) {
+        try {
+          summary = await summarizeChitChat(batch.chitChat, now);
+        } catch (err) {
+          // A missing recap is not worth losing the reminder list over.
+          console.warn('[scheduler] chit-chat summary failed:', err && err.message);
+        }
+      }
+
+      const message = msg.nightlyDigestPush({
+        reminders: batch.created,
+        chitChatSummary: summary,
+      });
+      if (!message) continue;
+
+      try {
+        await push(lineUserId, message);
+        result.sent += 1;
+      } catch (err) {
+        result.failed += 1;
+        console.error('[scheduler] nightly digest push failed for a user:', err && err.message);
+      }
+    }
+  } finally {
+    classifyRunning = false;
+  }
+
+  return result;
+}
+
 function start() {
   const job = cron.schedule(
     '* * * * *',
@@ -105,12 +200,20 @@ function start() {
     { timezone: config.timezone }
   );
 
-  // Housekeeping: drop confirmation drafts the user never answered.
-  const cleanup = cron.schedule(
-    '15 3 * * *',
+  // Midnight batch: turn the day's parked messages into reminders + a recap.
+  const classify = cron.schedule(
+    '0 0 * * *',
     () => {
-      const removed = store.purgeStaleDrafts();
-      if (removed) console.log('[scheduler] purged ' + removed + ' stale draft(s)');
+      classifyTick()
+        .then((r) => {
+          if (r && r.users) {
+            console.log(
+              '[scheduler] nightly classify: ' + r.users + ' user(s), ' +
+                r.reminders + ' reminder(s), ' + r.sent + ' push(es)'
+            );
+          }
+        })
+        .catch((err) => console.error('[scheduler] classify error:', err && err.message));
     },
     { timezone: config.timezone }
   );
@@ -130,7 +233,8 @@ function start() {
 
   console.log('[scheduler] reminder sweep running every minute (' + config.timezone + ')');
   console.log('[scheduler] daily digest scheduled at 06:00 (' + config.timezone + ')');
-  return { job, cleanup, digest };
+  console.log('[scheduler] nightly inbox classifier scheduled at 00:00 (' + config.timezone + ')');
+  return { job, classify, digest };
 }
 
-module.exports = { start, tick, digestTick };
+module.exports = { start, tick, digestTick, classifyTick };

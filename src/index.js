@@ -6,12 +6,22 @@ const { middleware: lineMiddleware } = require('@line/bot-sdk');
 const { config, assertConfig } = require('./config');
 const { handleEvent } = require('./webhook');
 const scheduler = require('./scheduler');
+const store = require('./db');
 
 assertConfig();
 
 const app = express();
 
 app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
+
+// Read-only view of this month's push consumption. Exposes counters only — no
+// user ids, no message content — matching the same open posture as /health.
+app.get('/usage', (_req, res) => {
+  const usage = store.getPushUsage();
+  return res
+    .status(200)
+    .json({ month: usage.month, count: usage.count, limit: config.pushLimit });
+});
 
 // The SDK middleware verifies x-line-signature and parses the body itself,
 // so no global express.json() may run ahead of it.

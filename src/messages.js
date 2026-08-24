@@ -2,88 +2,15 @@
 
 const { formatThai, relativeThai } = require('./datetime');
 
-const ACCENT = '#2E7D6B';
-
 const text = (t) => ({ type: 'text', text: t });
 
-/** Flex bubble asking the user to confirm a freshly parsed reminder. */
-function confirmFlex({ id, title, deadlineIso, category }) {
-  const rows = [
-    { label: 'งาน', value: title },
-    { label: 'กำหนด', value: formatThai(deadlineIso) },
-  ];
-  if (category) rows.push({ label: 'หมวด', value: category });
-
-  return {
-    type: 'flex',
-    altText: 'ยืนยันเตือนความจำ: ' + title + ' — ' + formatThai(deadlineIso),
-    contents: {
-      type: 'bubble',
-      header: {
-        type: 'box',
-        layout: 'vertical',
-        paddingAll: '16px',
-        backgroundColor: ACCENT,
-        contents: [
-          {
-            type: 'text',
-            text: 'เช็กให้หน่อยว่าถูกไหม',
-            color: '#FFFFFF',
-            size: 'md',
-            weight: 'bold',
-            wrap: true,
-          },
-        ],
-      },
-      body: {
-        type: 'box',
-        layout: 'vertical',
-        spacing: 'md',
-        paddingAll: '16px',
-        contents: rows.map((row) => ({
-          type: 'box',
-          layout: 'baseline',
-          spacing: 'sm',
-          contents: [
-            { type: 'text', text: row.label, size: 'sm', color: '#8C8C8C', flex: 2 },
-            { type: 'text', text: row.value, size: 'sm', color: '#111111', flex: 5, wrap: true },
-          ],
-        })),
-      },
-      footer: {
-        type: 'box',
-        layout: 'horizontal',
-        spacing: 'sm',
-        paddingAll: '12px',
-        contents: [
-          {
-            type: 'button',
-            style: 'secondary',
-            height: 'sm',
-            action: {
-              type: 'postback',
-              label: 'ยกเลิก',
-              data: 'action=cancel&id=' + id,
-              displayText: 'ยกเลิก',
-            },
-          },
-          {
-            type: 'button',
-            style: 'primary',
-            height: 'sm',
-            color: ACCENT,
-            action: {
-              type: 'postback',
-              label: 'ยืนยัน',
-              data: 'action=confirm&id=' + id,
-              displayText: 'ยืนยัน',
-            },
-          },
-        ],
-      },
-    },
-  };
-}
+/**
+ * Reply to a parked free-text message.
+ * Deliberately cheap: no model call happens at receive time any more, so this
+ * has to be a fixed string.
+ */
+const inboxAckText = () =>
+  text('รับทราบ จดไว้ให้แล้ว 📝\nเดี๋ยวสรุปให้ตอนเที่ยงคืนนะ');
 
 /** Text list of pending reminders, soonest first. */
 function listText(rows) {
@@ -103,12 +30,6 @@ function listText(rows) {
   );
 }
 
-const savedText = (r) =>
-  text('บันทึกแล้ว ✅\n#' + r.id + ' ' + r.title + '\nกำหนด ' + formatThai(r.deadline_iso) +
-    '\nเดี๋ยวเตือนล่วงหน้า 1 วัน, เตือนอีกที 1 ชั่วโมงก่อนถึงกำหนด และเตือนตอนถึงกำหนดจริง');
-
-const cancelledText = () => text('ยกเลิกให้แล้ว ไม่ได้บันทึกอะไรไว้ 👌\nลองพิมพ์ใหม่อีกทีได้เลย');
-
 const notFoundText = (id) =>
   text('ไม่เจอรายการ #' + id + ' นะ อาจจะถูกลบไปแล้ว\nลองดูรายการที่ค้างด้วย /list');
 
@@ -121,36 +42,12 @@ const helpText = () =>
     [
       'ใช้งานยังไงดี 👇',
       '',
-      '• พิมพ์งานพร้อมกำหนดส่งมาได้เลย เช่น "ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง"',
+      '• พิมพ์อะไรมาก็ได้ เช่น "ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง" — เที่ยงคืนจะสรุปกลับไปให้ว่าอันไหนเป็นงาน อันไหนเป็นเรื่องคุยเล่น',
       '• /list — ดูงานที่ยังค้าง',
       '• /done <เลขที่> — ปิดงานที่ทำเสร็จแล้ว',
       '• /delete <เลขที่> — ลบงานทิ้ง',
     ].join('\n')
   );
-
-const parseFailText = (code) => {
-  if (code === 'no_api_key') {
-    return text('ตอนนี้ระบบอ่านข้อความยังไม่พร้อมใช้งาน (ยังไม่ได้ตั้งค่า API key) 🙏\nลองใหม่อีกทีทีหลังนะ');
-  }
-  // Reachable from either provider now that Ox Alpha is primary and Gemini is
-  // the fallback — the wording stays deliberately provider-agnostic.
-  if (code === 'http_429') {
-    return text('ตอนนี้ตัวช่วยอ่านข้อความคิวแน่นไปหน่อย 🚦\nรอสักครู่แล้วส่งข้อความเดิมมาใหม่นะ');
-  }
-  if (code === 'network' || (code || '').startsWith('http_')) {
-    return text('ตัวช่วยอ่านข้อความล่มไปแป๊บนึง 😵‍💫\nรบกวนส่งข้อความเดิมมาใหม่อีกทีนะ');
-  }
-  return text(
-    [
-      'ยังจับใจความไม่ได้ว่าจะให้เตือนอะไร ตอนไหน 🤔',
-      'ลองเขียนให้มีทั้ง "งาน" กับ "เวลา" เช่น',
-      '• ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง',
-      '• นัดหมอพรุ่งนี้ 10 โมงเช้า',
-      '',
-      'หรือพิมพ์ /help ดูคำสั่งทั้งหมด',
-    ].join('\n')
-  );
-};
 
 const errorText = () =>
   text('ขออภัย ระบบสะดุดไปนิดนึง 🙏 ลองส่งใหม่อีกครั้งนะ');
@@ -189,24 +86,49 @@ function digestPush(rows) {
   );
 }
 
+/**
+ * Midnight batch result for one user: what got turned into a reminder, plus a
+ * one-paragraph recap of everything that was just chatter.
+ * Returns null when both halves are empty — there is nothing worth spending a
+ * push on, and the caller skips the user.
+ */
+function nightlyDigestPush({ reminders = [], chitChatSummary = null }) {
+  if (!reminders.length && !chitChatSummary) return null;
+
+  const parts = ['สรุปประจำวัน 🌙'];
+
+  if (reminders.length) {
+    const lines = reminders.map(
+      (r) => '• #' + r.id + ' ' + r.title + '\n   กำหนด ' + formatThai(r.deadline_iso)
+    );
+    parts.push('จดเป็นงานให้ ' + reminders.length + ' รายการ\n\n' + lines.join('\n'));
+  } else {
+    parts.push('วันนี้ไม่มีข้อความไหนที่เป็นงานให้จดนะ');
+  }
+
+  if (chitChatSummary) parts.push('เรื่องที่คุยกันวันนี้ 💬\n' + chitChatSummary);
+
+  if (reminders.length) parts.push('อันไหนเสร็จแล้วพิมพ์ /done <เลขที่> ได้เลย');
+
+  return text(parts.join('\n\n'));
+}
+
 const duePush = (r) =>
   text('🔔 ถึงกำหนดแล้ว!\n#' + r.id + ' ' + r.title + '\n' + formatThai(r.deadline_iso) +
     '\nทำเสร็จแล้วพิมพ์ /done ' + r.id);
 
 module.exports = {
   text,
-  confirmFlex,
+  inboxAckText,
   listText,
-  savedText,
-  cancelledText,
   notFoundText,
   doneText,
   deletedText,
   helpText,
-  parseFailText,
   errorText,
   dayBeforePush,
   hourBeforePush,
   duePush,
   digestPush,
+  nightlyDigestPush,
 };

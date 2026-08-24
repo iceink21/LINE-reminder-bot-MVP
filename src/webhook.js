@@ -3,7 +3,6 @@
 const store = require('./db');
 const msg = require('./messages');
 const { reply } = require('./line');
-const { parseReminder, ParseError } = require('./gemini');
 
 /** Match "/done 12" / "/delete 12" / "/list" — tolerant of extra spaces. */
 const COMMAND_RE = /^\/(list|done|delete|help)\b\s*(.*)$/i;
@@ -51,60 +50,21 @@ async function handleCommand(cmd, arg, userId, replyToken) {
   }
 }
 
+/**
+ * Park the message and answer immediately.
+ * No model call happens here any more: classification is batched to 00:00, so
+ * receiving a message costs one cheap (and quota-free) reply and one INSERT.
+ * `created_at` is UTC ISO, matching reminders.created_at — the nightly job
+ * needs it to resolve relative dates ("พรุ่งนี้") against when the message was
+ * actually sent, not against midnight.
+ */
 async function handleFreeText(text, userId, replyToken) {
-  let parsed;
-  try {
-    parsed = await parseReminder(text);
-  } catch (err) {
-    if (err instanceof ParseError) {
-      console.warn('[webhook] parse failed:', err.code);
-      return reply(replyToken, msg.parseFailText(err.code));
-    }
-    throw err;
-  }
-
-  // Persist as a draft first so the postback only has to carry an id.
-  const id = store.createDraft({
+  store.saveInboxMessage({
     lineUserId: userId,
-    title: parsed.title,
-    deadlineIso: parsed.deadlineIso,
-    category: parsed.category,
+    text,
+    createdAt: new Date().toISOString(),
   });
-
-  return reply(
-    replyToken,
-    msg.confirmFlex({
-      id,
-      title: parsed.title,
-      deadlineIso: parsed.deadlineIso,
-      category: parsed.category,
-    })
-  );
-}
-
-async function handlePostback(data, userId, replyToken) {
-  const params = new URLSearchParams(data || '');
-  const action = params.get('action');
-  const id = parseIdArg(params.get('id'));
-  if (!action || id === null) return reply(replyToken, msg.errorText());
-
-  const row = store.getReminder(id, userId);
-  if (!row) return reply(replyToken, msg.notFoundText(id));
-
-  if (action === 'confirm') {
-    if (row.status !== 'draft') {
-      return reply(replyToken, msg.text('รายการ #' + id + ' บันทึกไว้เรียบร้อยแล้วนะ ✅'));
-    }
-    store.confirmDraft(id, userId);
-    return reply(replyToken, msg.savedText(row));
-  }
-
-  if (action === 'cancel') {
-    if (row.status === 'draft') store.deleteReminder(id, userId);
-    return reply(replyToken, msg.cancelledText());
-  }
-
-  return reply(replyToken, msg.errorText());
+  return reply(replyToken, msg.inboxAckText());
 }
 
 /**
@@ -123,10 +83,6 @@ async function handleEvent(event) {
         msg.text('ยินดีที่ได้รู้จัก! ผมเป็นตัวช่วยจดงานและเตือนก่อนถึงกำหนดให้ 🙌'),
         msg.helpText(),
       ]);
-    }
-
-    if (event.type === 'postback') {
-      return await handlePostback(event.postback && event.postback.data, userId, replyToken);
     }
 
     if (event.type !== 'message' || event.message.type !== 'text') {

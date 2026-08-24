@@ -21,7 +21,14 @@ const config = {
   line: {
     channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || '',
     channelSecret: process.env.LINE_CHANNEL_SECRET || '',
+    // Recipient of the "quota almost gone" heads-up. Optional: without it the
+    // warning is only logged, and everything else keeps working.
+    adminUserId: process.env.ADMIN_LINE_USER_ID || '',
   },
+  // LINE's free Messaging API plan allows 200 push/multicast/broadcast messages
+  // per calendar month. Replies via replyToken are unlimited and never counted.
+  pushLimit: Number(process.env.PUSH_MONTHLY_LIMIT || 200),
+  pushWarnRatio: Number(process.env.PUSH_WARN_RATIO || 0.9),
   // Fallback provider, used whenever the primary parse fails for any reason.
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',

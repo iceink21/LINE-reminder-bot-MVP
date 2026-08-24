@@ -58,6 +58,25 @@ const RESPONSE_SCHEMA = {
   required: ['title', 'deadline_iso', 'confident'],
 };
 
+const CHITCHAT_RULES = [
+  'คุณคือผู้ช่วยที่สรุปบทสนทนาภาษาไทยของผู้ใช้ในหนึ่งวัน',
+  'ข้อความเหล่านี้คือข้อความที่ "ไม่ใช่" การสั่งงานหรือนัดหมาย',
+  'สรุปเป็นย่อหน้าสั้น ๆ ภาษาไทย ไม่เกิน 3 ประโยค ว่าผู้ใช้พูดถึงเรื่องอะไรบ้าง',
+  'ตอบเป็นข้อความล้วน ห้ามใส่ JSON, markdown, bullet หรือหัวข้อ',
+  'ห้ามแต่งเติมเรื่องที่ไม่มีในข้อความ',
+].join('\n');
+
+function buildChitChatPrompt(texts, now) {
+  return [
+    CHITCHAT_RULES,
+    '',
+    'เวลาปัจจุบัน (เขตเวลาไทย): ' + nowLocalIso(now),
+    '',
+    'ข้อความจากผู้ใช้:',
+    texts.map((t, i) => i + 1 + '. ' + t).join('\n'),
+  ].join('\n');
+}
+
 function buildPrompt(userText, now) {
   return [
     SYSTEM_RULES,
@@ -117,15 +136,17 @@ function finalizeResult(rawText, provider) {
  * Now the fallback leg: reached only after Ox Alpha has already failed, so any
  * ParseError thrown here is terminal and surfaces to the user.
  */
-async function callGemini(prompt) {
+async function callGemini(prompt, { json = true } = {}) {
   const url = API_BASE + encodeURIComponent(config.gemini.model) + ':generateContent';
   const body = {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: 'application/json',
-      responseSchema: RESPONSE_SCHEMA,
-    },
+    generationConfig: json
+      ? {
+          temperature: 0,
+          responseMimeType: 'application/json',
+          responseSchema: RESPONSE_SCHEMA,
+        }
+      : { temperature: 0.3 },
   };
 
   let res;
@@ -177,13 +198,13 @@ async function callGemini(prompt) {
  * JSON-ness rests on the same SYSTEM_RULES instructions plus response_format,
  * with extractJson() as a net — and, failing that, the Gemini fallback.
  */
-async function callOpenRouter(prompt) {
+async function callOpenRouter(prompt, { json = true } = {}) {
   const body = {
     model: config.openrouter.model,
     messages: [{ role: 'user', content: prompt }],
-    temperature: 0,
-    response_format: { type: 'json_object' },
+    temperature: json ? 0 : 0.3,
   };
+  if (json) body.response_format = { type: 'json_object' };
 
   let res;
   try {
@@ -234,36 +255,81 @@ async function callOpenRouter(prompt) {
  *     message, so it surfaces as-is.
  * Throws ParseError on anything the caller should answer with a Thai retry message.
  */
-async function parseReminder(userText, now = new Date()) {
-  if (!config.openrouter.apiKey || config.openrouter.apiKey.startsWith('REPLACE_ME')) {
+function isKeyMissing(key) {
+  return !key || key.startsWith('REPLACE_ME');
+}
+
+/**
+ * Run one prompt through Ox Alpha, falling back to Gemini, and hand the raw
+ * response text to `finalize`. Both callers share this so the retry/timeout,
+ * fallback-trigger and key-guard rules can never drift apart between them.
+ *
+ * `finalize` runs inside the try on purpose: an unusable response from Ox Alpha
+ * is exactly the kind of failure the fallback exists to absorb.
+ */
+async function runWithFallback({ label, prompt, finalize, json }) {
+  if (isKeyMissing(config.openrouter.apiKey)) {
     throw new ParseError('OPENROUTER_API_KEY is not configured', 'no_api_key');
   }
 
-  const prompt = buildPrompt(userText, now);
-
   try {
-    // finalizeResult sits inside the try on purpose: unusable JSON from Ox Alpha
-    // is exactly the kind of failure the fallback exists to absorb.
-    const result = finalizeResult(await callOpenRouter(prompt), config.openrouter.model);
-    console.info('[parseReminder] served by ox-alpha (primary) (' + config.openrouter.model + ')');
+    const result = finalize(await callOpenRouter(prompt, { json }), config.openrouter.model);
+    console.info('[' + label + '] served by ox-alpha (primary) (' + config.openrouter.model + ')');
     return result;
   } catch (err) {
     const recoverable = err instanceof ParseError && err.code !== 'low_confidence';
     if (!recoverable) throw err;
-    if (!config.gemini.apiKey || config.gemini.apiKey.startsWith('REPLACE_ME')) {
+    if (isKeyMissing(config.gemini.apiKey)) {
       console.warn(
-        '[parseReminder] ox-alpha failed (' + err.code + ') and no GEMINI_API_KEY — giving up'
+        '[' + label + '] ox-alpha failed (' + err.code + ') and no GEMINI_API_KEY — giving up'
       );
       throw err;
     }
     console.warn(
-      '[parseReminder] ox-alpha failed (' + err.code + '), falling back to ' + config.gemini.model
+      '[' + label + '] ox-alpha failed (' + err.code + '), falling back to ' + config.gemini.model
     );
-    const fallbackText = await callGemini(prompt);
-    const result = finalizeResult(fallbackText, config.gemini.model);
-    console.debug('[parseReminder] served by gemini fallback (' + config.gemini.model + ')');
+    const result = finalize(await callGemini(prompt, { json }), config.gemini.model);
+    console.debug('[' + label + '] served by gemini fallback (' + config.gemini.model + ')');
     return result;
   }
 }
 
-module.exports = { parseReminder, ParseError };
+async function parseReminder(userText, now = new Date()) {
+  return runWithFallback({
+    label: 'parseReminder',
+    prompt: buildPrompt(userText, now),
+    finalize: finalizeResult,
+    json: true,
+  });
+}
+
+/** Trim a free-text summary down to something a push message can carry. */
+function finalizeSummary(rawText, provider) {
+  const summary = String(rawText || '')
+    .replace(/```/g, '')
+    .trim();
+  if (!summary) throw new ParseError('Empty summary (' + provider + ')', 'empty_summary');
+  return summary.slice(0, 500);
+}
+
+/**
+ * Summarise a day's worth of non-schedule messages from ONE user into a short
+ * Thai paragraph. Same primary/fallback path as parseReminder.
+ * The caller must not pass an empty array — an empty bucket means there is
+ * nothing to summarise and no call should be made at all.
+ * Throws ParseError; the nightly job degrades to "no summary" rather than
+ * dropping the whole digest.
+ */
+async function summarizeChitChat(texts, now = new Date()) {
+  if (!Array.isArray(texts) || !texts.length) {
+    throw new ParseError('summarizeChitChat called with no messages', 'empty_input');
+  }
+  return runWithFallback({
+    label: 'summarizeChitChat',
+    prompt: buildChitChatPrompt(texts, now),
+    finalize: finalizeSummary,
+    json: false,
+  });
+}
+
+module.exports = { parseReminder, summarizeChitChat, ParseError };

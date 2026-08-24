@@ -32,6 +32,16 @@ function nowLocalIso(date = new Date()) {
   );
 }
 
+/**
+ * Calendar month as seen in the bot's timezone, e.g. "2026-08".
+ * The LINE push quota resets on the Thai calendar month, not on UTC's, so the
+ * key has to come from tzParts rather than from `Date#toISOString().slice(0,7)`.
+ */
+function monthKey(date = new Date()) {
+  const p = tzParts(date);
+  return p.year + '-' + p.month;
+}
+
 /** Thai weekday name for prompt grounding ("วันอาทิตย์" etc.). */
 function thaiWeekday(date = new Date()) {
   return new Intl.DateTimeFormat('th-TH', { timeZone: TZ, weekday: 'long' }).format(date);
@@ -87,6 +97,7 @@ function toUtcIso(value) {
 
 module.exports = {
   nowLocalIso,
+  monthKey,
   thaiWeekday,
   formatThai,
   relativeThai,
