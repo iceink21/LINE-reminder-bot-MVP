@@ -3,6 +3,7 @@
 const store = require('./db');
 const msg = require('./messages');
 const { reply } = require('./line');
+const { parseReminder, ParseError } = require('./gemini');
 
 /** Match "/done 12" / "/delete 12" / "/list" — tolerant of extra spaces. */
 const COMMAND_RE = /^\/(list|done|delete|help)\b\s*(.*)$/i;
@@ -51,12 +52,10 @@ async function handleCommand(cmd, arg, userId, replyToken) {
 }
 
 /**
- * Park the message and answer immediately.
- * No model call happens here any more: classification is batched to 00:00, so
- * receiving a message costs one cheap (and quota-free) reply and one INSERT.
- * `created_at` is UTC ISO, matching reminders.created_at — the nightly job
- * needs it to resolve relative dates ("พรุ่งนี้") against when the message was
- * actually sent, not against midnight.
+ * Log the message, then parse it right away so a reminder shows up in /list the
+ * moment it is sent. The inbox row is kept regardless of the parse outcome — it
+ * is the raw record the midnight job recaps the whole day's conversation from.
+ * There is no draft/confirm step: a successful parse goes straight to 'pending'.
  */
 async function handleFreeText(text, userId, replyToken) {
   store.saveInboxMessage({
@@ -64,7 +63,32 @@ async function handleFreeText(text, userId, replyToken) {
     text,
     createdAt: new Date().toISOString(),
   });
-  return reply(replyToken, msg.inboxAckText());
+
+  let parsed;
+  try {
+    parsed = await parseReminder(text);
+  } catch (err) {
+    // A ParseError — including 'low_confidence' — just means this was not a
+    // task. Anything else is a real failure and belongs to handleEvent's catch.
+    if (!(err instanceof ParseError)) throw err;
+    return reply(replyToken, msg.inboxAckText());
+  }
+
+  const id = store.createPendingReminder({
+    lineUserId: userId,
+    title: parsed.title,
+    deadlineIso: parsed.deadlineIso,
+    category: parsed.category,
+  });
+  return reply(
+    replyToken,
+    msg.reminderAddedText({
+      id,
+      title: parsed.title,
+      deadlineIso: parsed.deadlineIso,
+      category: parsed.category,
+    })
+  );
 }
 
 /**

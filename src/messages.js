@@ -5,12 +5,24 @@ const { formatThai, relativeThai } = require('./datetime');
 const text = (t) => ({ type: 'text', text: t });
 
 /**
- * Reply to a parked free-text message.
- * Deliberately cheap: no model call happens at receive time any more, so this
- * has to be a fixed string.
+ * Reply for a message the parser rejected — i.e. genuinely not a task.
+ * It must not promise a reminder later: anything that parses as one is already
+ * a reminder by the time this string is reached.
  */
 const inboxAckText = () =>
-  text('รับทราบ จดไว้ให้แล้ว 📝\nเดี๋ยวสรุปให้ตอนเที่ยงคืนนะ');
+  text('รับทราบ 📝\nเดี๋ยวสรุปบทสนทนาของวันนี้ให้ตอนเที่ยงคืนนะ');
+
+/** Confirmation for a reminder created straight from the message just sent. */
+function reminderAddedText({ id, title, deadlineIso, category }) {
+  const lines = [
+    'จดให้แล้ว ✅',
+    '#' + id + ' ' + title,
+    'กำหนด ' + formatThai(deadlineIso) + ' (' + relativeThai(deadlineIso) + ')',
+  ];
+  if (category) lines.push('หมวด: ' + category);
+  lines.push('', 'ดูงานค้างทั้งหมด /list · เสร็จแล้วพิมพ์ /done ' + id);
+  return text(lines.join('\n'));
+}
 
 /** Text list of pending reminders, soonest first. */
 function listText(rows) {
@@ -42,7 +54,7 @@ const helpText = () =>
     [
       'ใช้งานยังไงดี 👇',
       '',
-      '• พิมพ์อะไรมาก็ได้ เช่น "ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง" — เที่ยงคืนจะสรุปกลับไปให้ว่าอันไหนเป็นงาน อันไหนเป็นเรื่องคุยเล่น',
+      '• พิมพ์อะไรมาก็ได้ เช่น "ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง" — ถ้าเป็นงาน จะจดให้ทันที ส่วนเรื่องคุยเล่นจะสรุปให้ตอนเที่ยงคืน',
       '• /list — ดูงานที่ยังค้าง',
       '• /done <เลขที่> — ปิดงานที่ทำเสร็จแล้ว',
       '• /delete <เลขที่> — ลบงานทิ้ง',
@@ -87,30 +99,13 @@ function digestPush(rows) {
 }
 
 /**
- * Midnight batch result for one user: what got turned into a reminder, plus a
- * one-paragraph recap of everything that was just chatter.
- * Returns null when both halves are empty — there is nothing worth spending a
- * push on, and the caller skips the user.
+ * Midnight recap of the whole day's conversation for one user.
+ * Returns null when there is no summary — a "nothing happened" ping is not
+ * worth a push, and the caller skips the user.
  */
-function nightlyDigestPush({ reminders = [], chitChatSummary = null }) {
-  if (!reminders.length && !chitChatSummary) return null;
-
-  const parts = ['สรุปประจำวัน 🌙'];
-
-  if (reminders.length) {
-    const lines = reminders.map(
-      (r) => '• #' + r.id + ' ' + r.title + '\n   กำหนด ' + formatThai(r.deadline_iso)
-    );
-    parts.push('จดเป็นงานให้ ' + reminders.length + ' รายการ\n\n' + lines.join('\n'));
-  } else {
-    parts.push('วันนี้ไม่มีข้อความไหนที่เป็นงานให้จดนะ');
-  }
-
-  if (chitChatSummary) parts.push('เรื่องที่คุยกันวันนี้ 💬\n' + chitChatSummary);
-
-  if (reminders.length) parts.push('อันไหนเสร็จแล้วพิมพ์ /done <เลขที่> ได้เลย');
-
-  return text(parts.join('\n\n'));
+function dailyRecapPush(summary) {
+  if (!summary) return null;
+  return text('สรุปบทสนทนาวันนี้ 🌙\n\n' + summary);
 }
 
 const duePush = (r) =>
@@ -130,5 +125,6 @@ module.exports = {
   hourBeforePush,
   duePush,
   digestPush,
-  nightlyDigestPush,
+  reminderAddedText,
+  dailyRecapPush,
 };

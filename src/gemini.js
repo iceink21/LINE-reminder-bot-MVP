@@ -7,13 +7,14 @@ const { nowLocalIso, thaiWeekday, toUtcIso } = require('./datetime');
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 // Primary provider: OpenAI-compatible chat/completions (Ox Alpha).
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-// gemini-3.6-flash is a thinking model: even a one-line parse burns a few hundred
-// thinking tokens, and measured round-trips ranged 11.5-22.6s. Thinking cannot be
-// switched off for this model (thinkingBudget: 0 is rejected with HTTP 400, and a
-// 128-token budget did not shorten the call), so the only lever is the timeout.
-// The webhook already ACKs LINE immediately and parses asynchronously, so a long
-// ceiling here costs nothing but a slower failure on a genuinely stuck request.
-const REQUEST_TIMEOUT_MS = 45000;
+// The webhook now parses inline before replying, so this ceiling sits on the
+// critical path of a LINE reply token: a stuck request can outlive the token
+// and the user gets silence instead of a reply. Kept short for that reason,
+// even though gemini-3.6-flash (the fallback, a thinking model that cannot
+// have thinking switched off) has measured round-trips of 11.5-22.6s on its
+// own — a call that lands past this ceiling reports as a timeout rather than
+// completing, which is the accepted trade-off for keeping the reply prompt.
+const REQUEST_TIMEOUT_MS = 12000;
 // Free-tier RPM caps on gemini-3.6-flash produce transient 429s under normal
 // traffic — retry a couple times with backoff before giving up, honoring
 // Retry-After when Gemini sends it.
@@ -58,17 +59,17 @@ const RESPONSE_SCHEMA = {
   required: ['title', 'deadline_iso', 'confident'],
 };
 
-const CHITCHAT_RULES = [
+const DAY_RULES = [
   'คุณคือผู้ช่วยที่สรุปบทสนทนาภาษาไทยของผู้ใช้ในหนึ่งวัน',
-  'ข้อความเหล่านี้คือข้อความที่ "ไม่ใช่" การสั่งงานหรือนัดหมาย',
-  'สรุปเป็นย่อหน้าสั้น ๆ ภาษาไทย ไม่เกิน 3 ประโยค ว่าผู้ใช้พูดถึงเรื่องอะไรบ้าง',
+  'ข้อความเหล่านี้คือข้อความทั้งหมดที่ผู้ใช้ส่งมาในวันนี้ ทั้งเรื่องงานและเรื่องทั่วไป',
+  'สรุปสิ่งที่ผู้ใช้พูดคุย/ทำในวันนี้ทั้งหมด เป็นย่อหน้าสั้น ๆ ภาษาไทย ไม่เกิน 3 ประโยค',
   'ตอบเป็นข้อความล้วน ห้ามใส่ JSON, markdown, bullet หรือหัวข้อ',
   'ห้ามแต่งเติมเรื่องที่ไม่มีในข้อความ',
 ].join('\n');
 
-function buildChitChatPrompt(texts, now) {
+function buildDayPrompt(texts, now) {
   return [
-    CHITCHAT_RULES,
+    DAY_RULES,
     '',
     'เวลาปัจจุบัน (เขตเวลาไทย): ' + nowLocalIso(now),
     '',
@@ -313,23 +314,23 @@ function finalizeSummary(rawText, provider) {
 }
 
 /**
- * Summarise a day's worth of non-schedule messages from ONE user into a short
- * Thai paragraph. Same primary/fallback path as parseReminder.
+ * Summarise ALL of one user's messages for the day — task and non-task alike —
+ * into a short Thai paragraph. Same primary/fallback path as parseReminder.
  * The caller must not pass an empty array — an empty bucket means there is
  * nothing to summarise and no call should be made at all.
  * Throws ParseError; the nightly job degrades to "no summary" rather than
- * dropping the whole digest.
+ * leaving the day's messages unprocessed.
  */
-async function summarizeChitChat(texts, now = new Date()) {
+async function summarizeDay(texts, now = new Date()) {
   if (!Array.isArray(texts) || !texts.length) {
-    throw new ParseError('summarizeChitChat called with no messages', 'empty_input');
+    throw new ParseError('summarizeDay called with no messages', 'empty_input');
   }
   return runWithFallback({
-    label: 'summarizeChitChat',
-    prompt: buildChitChatPrompt(texts, now),
+    label: 'summarizeDay',
+    prompt: buildDayPrompt(texts, now),
     finalize: finalizeSummary,
     json: false,
   });
 }
 
-module.exports = { parseReminder, summarizeChitChat, ParseError };
+module.exports = { parseReminder, summarizeDay, ParseError };
