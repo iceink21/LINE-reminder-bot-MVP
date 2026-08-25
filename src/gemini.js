@@ -67,6 +67,35 @@ const DAY_RULES = [
   'ห้ามแต่งเติมเรื่องที่ไม่มีในข้อความ',
 ].join('\n');
 
+const CHAT_RULES = [
+  'คุณคือผู้ช่วยส่วนตัวใน LINE ของผู้ใช้ พูดแทนตัวเองว่า "ผม"',
+  'ตอบสั้น กระชับ เป็นกันเอง ใช้ภาษาไทยเป็นหลัก ใส่อีโมจิได้บ้างแต่อย่าเยอะ',
+  'นอกจากคุยเล่น คุณยังทำหน้าที่จดงานและเตือนก่อนถึงกำหนดให้ด้วย',
+  'ถ้าผู้ใช้ถามว่าทำอะไรได้บ้าง ให้บอกว่าพิมพ์งานพร้อมกำหนดส่งมาได้เลย เดี๋ยวจดและเตือนให้ และมีคำสั่ง /list /done /delete',
+  // The task path already ran and declined this message, so re-parsing it here
+  // would only produce a second, conflicting verdict.
+  'ข้อความนี้ไม่ใช่การสั่งงาน ให้คุยตอบตามปกติ ห้ามพยายามแปลงเป็นรายการงานหรือถามหากำหนดส่ง',
+  'ตอบเป็นข้อความล้วน ห้ามใส่ JSON, markdown หรือ code fence',
+  'ห้ามแต่งเรื่องที่ไม่รู้ ถ้าไม่รู้ให้บอกตรง ๆ',
+].join('\n');
+
+function buildChatPrompt(userText, history, now) {
+  const turns = (history || []).map(
+    (h) => (h.role === 'assistant' ? 'คุณ: ' : 'ผู้ใช้: ') + h.content
+  );
+  return [
+    CHAT_RULES,
+    '',
+    'เวลาปัจจุบัน (เขตเวลาไทย): ' + nowLocalIso(now),
+    '',
+    'บทสนทนาก่อนหน้า:',
+    turns.length ? turns.join('\n') : '(ยังไม่มี)',
+    '',
+    'ข้อความใหม่จากผู้ใช้:',
+    userText,
+  ].join('\n');
+}
+
 function buildDayPrompt(texts, now) {
   return [
     DAY_RULES,
@@ -333,4 +362,32 @@ async function summarizeDay(texts, now = new Date()) {
   });
 }
 
-module.exports = { parseReminder, summarizeDay, ParseError };
+/**
+ * Trim a free-text chat reply. The cap is well under LINE's 5000-char message
+ * limit — a chat turn that long is a runaway answer, not a conversation.
+ */
+function finalizeChatReply(rawText, provider) {
+  const replyText = String(rawText || '')
+    .replace(/```/g, '')
+    .trim();
+  if (!replyText) throw new ParseError('Empty chat reply (' + provider + ')', 'empty_reply');
+  return replyText.slice(0, 1000);
+}
+
+/**
+ * Answer a message the reminder parser already rejected, in conversation.
+ * `history` is `[{ role, content }]` oldest first, as `getRecentChatHistory`
+ * returns it. Same primary/fallback path as parseReminder, so timeout and
+ * retry behaviour cannot drift between the three call sites.
+ * Throws ParseError; the caller degrades to a canned ack rather than silence.
+ */
+async function chatReply(userText, history, now = new Date()) {
+  return runWithFallback({
+    label: 'chatReply',
+    prompt: buildChatPrompt(userText, history, now),
+    finalize: finalizeChatReply,
+    json: false,
+  });
+}
+
+module.exports = { parseReminder, summarizeDay, chatReply, ParseError };

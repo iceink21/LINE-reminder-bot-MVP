@@ -43,6 +43,20 @@ const SCHEMA_SQL = [
   ');',
   'CREATE INDEX IF NOT EXISTS idx_inbox_unprocessed',
   '  ON inbox_messages (processed_at, line_user_id, id);',
+  // Conversational turns for the chat fallback — a separate concern from
+  // inbox_messages, which stays a raw log for the nightly recap. Rows are never
+  // pruned: a personal single-user bot will not outgrow SQLite here.
+  'CREATE TABLE IF NOT EXISTS chat_history (',
+  '  id           INTEGER PRIMARY KEY AUTOINCREMENT,',
+  '  line_user_id TEXT    NOT NULL,',
+  // role: user | assistant
+  '  role         TEXT    NOT NULL,',
+  '  content      TEXT    NOT NULL,',
+  // UTC ISO-8601, same convention as reminders.created_at
+  '  created_at   TEXT    NOT NULL',
+  ');',
+  'CREATE INDEX IF NOT EXISTS idx_chat_history_user',
+  '  ON chat_history (line_user_id, id);',
   // Monthly LINE push/multicast/broadcast counter. Replies are unlimited and
   // deliberately not counted here. `month` is a YYYY-MM key in Asia/Bangkok.
   'CREATE TABLE IF NOT EXISTS push_log (',
@@ -107,6 +121,13 @@ const SQL = {
     'SELECT * FROM inbox_messages WHERE line_user_id = ? AND processed_at IS NULL ' +
     'ORDER BY id ASC',
   markInboxDone: 'UPDATE inbox_messages SET processed_at = ? WHERE id = ?',
+
+  insertChat:
+    'INSERT INTO chat_history (line_user_id, role, content, created_at) ' +
+    'VALUES (@line_user_id, @role, @content, @created_at)',
+  // Newest-first so LIMIT takes the most recent turns; the caller reverses.
+  recentChat:
+    'SELECT * FROM chat_history WHERE line_user_id = ? ORDER BY id DESC LIMIT ?',
 
   bumpPush:
     'INSERT INTO push_log (month, count, warned) VALUES (?, 1, 0) ' +
@@ -232,6 +253,27 @@ const markInboxProcessed = db.transaction((ids) => {
   return ids.length;
 });
 
+// --- chat history: short-term memory for the conversational fallback ---
+
+/** Append one turn; `createdAt` is a UTC ISO string. */
+function saveChatMessage({ lineUserId, role, content, createdAt }) {
+  const info = stmt.insertChat.run({
+    line_user_id: lineUserId,
+    role,
+    content,
+    created_at: createdAt || new Date().toISOString(),
+  });
+  return Number(info.lastInsertRowid);
+}
+
+/**
+ * That user's last `limit` turns, oldest first so they drop straight into a
+ * prompt in reading order. SQLite cannot take the newest N and re-sort them
+ * ascending in one statement, so the reversal happens here.
+ */
+const getRecentChatHistory = (lineUserId, limit) =>
+  stmt.recentChat.all(lineUserId, limit).reverse();
+
 // --- push quota: LINE's free plan caps push/multicast/broadcast per month ---
 
 /** Count one outbound push; returns the resulting { month, count, warned }. */
@@ -268,6 +310,8 @@ module.exports = {
   listUnprocessedByUser,
   listUnprocessedForUser,
   markInboxProcessed,
+  saveChatMessage,
+  getRecentChatHistory,
   incrementPushCount,
   markPushWarned,
   getPushUsage,

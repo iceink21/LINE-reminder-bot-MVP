@@ -3,7 +3,11 @@
 const store = require('./db');
 const msg = require('./messages');
 const { reply } = require('./line');
-const { parseReminder, ParseError } = require('./gemini');
+const { parseReminder, chatReply, ParseError } = require('./gemini');
+
+// How many past turns ride along in the chat prompt. Enough to hold a thread
+// across a few exchanges without letting the prompt grow unbounded.
+const CHAT_HISTORY_TURNS = 12;
 
 /** Match "/done 12" / "/delete 12" / "/list" — tolerant of extra spaces. */
 const COMMAND_RE = /^\/(list|done|delete|help)\b\s*(.*)$/i;
@@ -52,6 +56,35 @@ async function handleCommand(cmd, arg, userId, replyToken) {
 }
 
 /**
+ * Answer a message that was not a task, in conversation.
+ * Only the chat turns are stored here — the raw inbox row was already written
+ * by the caller, and the two logs serve different jobs.
+ * A ParseError means the chat call itself failed; a canned ack beats silence,
+ * and the nightly recap it mentions genuinely still runs.
+ */
+async function replyAsChat(text, userId, replyToken) {
+  const history = store.getRecentChatHistory(userId, CHAT_HISTORY_TURNS);
+
+  let chatText;
+  try {
+    chatText = await chatReply(text, history, new Date());
+  } catch (err) {
+    if (!(err instanceof ParseError)) throw err;
+    return reply(replyToken, msg.inboxAckText());
+  }
+
+  const now = new Date().toISOString();
+  store.saveChatMessage({ lineUserId: userId, role: 'user', content: text, createdAt: now });
+  store.saveChatMessage({
+    lineUserId: userId,
+    role: 'assistant',
+    content: chatText,
+    createdAt: now,
+  });
+  return reply(replyToken, msg.text(chatText));
+}
+
+/**
  * Log the message, then parse it right away so a reminder shows up in /list the
  * moment it is sent. The inbox row is kept regardless of the parse outcome — it
  * is the raw record the midnight job recaps the whole day's conversation from.
@@ -71,7 +104,7 @@ async function handleFreeText(text, userId, replyToken) {
     // A ParseError — including 'low_confidence' — just means this was not a
     // task. Anything else is a real failure and belongs to handleEvent's catch.
     if (!(err instanceof ParseError)) throw err;
-    return reply(replyToken, msg.inboxAckText());
+    return replyAsChat(text, userId, replyToken);
   }
 
   const id = store.createPendingReminder({

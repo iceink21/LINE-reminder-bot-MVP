@@ -5,12 +5,13 @@ const { formatThai, relativeThai } = require('./datetime');
 const text = (t) => ({ type: 'text', text: t });
 
 /**
- * Reply for a message the parser rejected — i.e. genuinely not a task.
+ * Last-resort reply when the message was not a task AND the chat call failed.
  * It must not promise a reminder later: anything that parses as one is already
- * a reminder by the time this string is reached.
+ * a reminder by the time this string is reached. The midnight recap it points
+ * at is real — that job runs off the inbox row, which was saved either way.
  */
 const inboxAckText = () =>
-  text('รับทราบ 📝\nเดี๋ยวสรุปบทสนทนาของวันนี้ให้ตอนเที่ยงคืนนะ');
+  text('รับทราบ 📝\nตอนนี้ผมตอบยาว ๆ ไม่ไหวแป๊บนึง แต่เดี๋ยวสรุปบทสนทนาของวันนี้ให้ตอนเที่ยงคืนนะ');
 
 /** Confirmation for a reminder created straight from the message just sent. */
 function reminderAddedText({ id, title, deadlineIso, category }) {
@@ -54,7 +55,7 @@ const helpText = () =>
     [
       'ใช้งานยังไงดี 👇',
       '',
-      '• พิมพ์อะไรมาก็ได้ เช่น "ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง" — ถ้าเป็นงาน จะจดให้ทันที ส่วนเรื่องคุยเล่นจะสรุปให้ตอนเที่ยงคืน',
+      '• พิมพ์อะไรมาก็ได้ เช่น "ส่งรายงาน JS วันศุกร์นี้บ่าย 3 โมง" — ถ้าเป็นงาน จะจดให้ทันที ถ้าคุยเล่นก็ตอบคุยด้วยได้เลย',
       '• /list — ดูงานที่ยังค้าง',
       '• /done <เลขที่> — ปิดงานที่ทำเสร็จแล้ว',
       '• /delete <เลขที่> — ลบงานทิ้ง',
