@@ -1,11 +1,18 @@
 'use strict';
 
 const { config } = require('./config');
-const { nowLocalIso, thaiWeekday, toUtcIso } = require('./datetime');
+const {
+  nowLocalIso,
+  thaiWeekday,
+  toUtcIso,
+  resolveWeekday,
+  withTimeOfDay,
+} = require('./datetime');
 
 // Fallback provider — see parseReminder().
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
-// Primary provider: OpenAI-compatible chat/completions (Ox Alpha).
+// Primary provider: OpenAI-compatible chat/completions (NVIDIA Nemotron 3.5
+// Lightning, free tier, via OpenRouter).
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 // The webhook now parses inline before replying, so this ceiling sits on the
 // critical path of a LINE reply token: a stuck request can outlive the token
@@ -38,25 +45,65 @@ class ParseError extends Error {
 const SYSTEM_RULES = [
   'คุณคือระบบแยกวิเคราะห์ข้อความภาษาไทยให้เป็นข้อมูลงานที่มีกำหนดส่ง',
   'ตอบกลับเป็น JSON เท่านั้น ห้ามมีข้อความอื่นหรือ markdown code fence',
-  'รูปแบบ: {"title": string, "deadline_iso": string, "category": string|null, "confident": boolean}',
+  'รูปแบบ: {"title": string, "deadline_iso": string|null, "relative_weekday": string|null, "weekday_qualifier": "this"|"next"|null, "time_of_day": string|null, "category": string|null, "recurring": boolean, "confident": boolean}',
   '- title: ชื่องานสั้น กระชับ ภาษาไทย ไม่ต้องใส่วันเวลาซ้ำในชื่อ',
+  '- recurring: true เมื่อเป็นสิ่งที่ต้องทำ "ทุกวัน" เป็นประจำ ไม่มีวันกำหนดส่งตายตัว',
+  '  เช่น "กินยาทุกวัน", "เตือนดื่มน้ำให้ครบทุกวัน", "ออกกำลังกายทุกเช้า" → recurring: true',
+  '  ถ้า recurring เป็น true ให้ใส่ deadline_iso เป็น null และห้ามเดาวันกำหนดส่งขึ้นมาเอง',
+  '- recurring: false (ค่าปกติ) สำหรับงานครั้งเดียวที่มีกำหนดส่ง — ต้องมี deadline_iso เสมอ',
+  '  ยกเว้นกรณีที่ผู้ใช้อ้างถึงชื่อวันในสัปดาห์ ให้เว้น deadline_iso เป็น null แล้วใช้ relative_weekday แทน (ดูกฎด้านล่าง)',
   '- deadline_iso: ISO 8601 พร้อม offset +07:00 (เวลาไทย) เช่น 2026-08-28T15:00:00+07:00',
-  '- คำนวณวันที่สัมพัทธ์ ("พรุ่งนี้", "ศุกร์นี้", "อีก 3 วัน", "สิ้นเดือน") จากเวลาปัจจุบันที่ให้ไว้',
-  '- "ศุกร์นี้/ศุกร์หน้า" = วันศุกร์ถัดไปที่ยังมาไม่ถึง; "บ่าย 3 โมง" = 15:00; "ทุ่ม" = 19:00 + n',
+  '- คำนวณวันที่สัมพัทธ์ ("พรุ่งนี้", "วันนี้", "อีก 3 วัน", "สิ้นเดือน") จากเวลาปัจจุบันที่ให้ไว้',
+  '  และวันที่ระบุตรง ๆ (เช่น "28 ส.ค.", "2026-08-28") ก็ใส่ deadline_iso ตามปกติ',
+  // The model is unreliable at weekday arithmetic, so it is taken out of the
+  // loop entirely: it names the weekday, resolveWeekday() does the math.
+  '- ถ้าผู้ใช้อ้างถึง "ชื่อวันในสัปดาห์" ("จันทร์นี้", "วันจันทร์หน้า", "ศุกร์หน้า", "พุธนี้")',
+  '  ให้ถือว่ากฎนี้เหนือกว่ากฎ "ต้องมี deadline_iso เสมอ" ข้างบนเสมอ',
+  '  ห้ามคำนวณวันที่เอง ให้ deadline_iso เป็น null — แล้วระบุเป็นสัญลักษณ์แทน:',
+  '  relative_weekday = ชื่อวันล้วน ๆ หนึ่งใน "จันทร์","อังคาร","พุธ","พฤหัสบดี","ศุกร์","เสาร์","อาทิตย์"',
+  '  weekday_qualifier = "this" ถ้าผู้ใช้พูดว่า "...นี้", "next" ถ้าพูดว่า "...หน้า", ไม่ชัดให้ null',
+  '  time_of_day = เวลาในรูป "HH:MM" แบบ 24 ชั่วโมง ถ้าผู้ใช้ระบุเวลา ไม่ระบุให้ null',
+  '  ระบบจะคำนวณวันที่จริงให้เอง ไม่ต้องคิดแทน',
+  // "อาทิตย์" is both "Sunday" and "week". Bare "อาทิตย์หน้า" almost always
+  // means NEXT WEEK, and letting it fill the symbolic slot would fire the
+  // reminder on Sunday — up to six days early. Disambiguated here, at the
+  // prompt, because only the prompt still sees the user's original wording.
+  '- คำว่า "อาทิตย์" ภาษาไทยหมายได้ทั้ง "วันอาทิตย์" และ "สัปดาห์" ให้แยกตามการมี "วัน" นำหน้า',
+  '  ถ้าผู้ใช้พูดว่า "อาทิตย์หน้า"/"อาทิตย์นี้" โดยไม่มี "วัน" นำหน้า ให้ถือว่าหมายถึงสัปดาห์ ไม่ใช่วันอาทิตย์',
+  '  กรณีนี้ห้ามใส่ relative_weekday (ให้เป็น null) แต่ให้คำนวณวันที่แล้วใส่ deadline_iso ตามปกติ',
+  '  ส่วน "วันอาทิตย์หน้า"/"วันอาทิตย์นี้" (มี "วัน" นำหน้า) หมายถึงวันอาทิตย์จริง ๆ',
+  '  ให้ใช้ relative_weekday = "อาทิตย์" และ deadline_iso = null ตามกฎชื่อวันข้างบน',
+  '- ถ้าไม่ได้อ้างชื่อวันในสัปดาห์ ให้ relative_weekday, weekday_qualifier, time_of_day เป็น null ทั้งหมด',
+  '- "บ่าย 3 โมง" = 15:00; "ทุ่ม" = 19:00 + n',
+  '- "คาบ N" (คาบเรียนที่ N) = เวลาเริ่มคาบนั้น คิดจาก 08:00 แล้วบวก (N-1) ชั่วโมง',
+  '  เช่น คาบ 1 = 08:00, คาบ 2 = 09:00, คาบ 3 = 10:00, คาบ 4 = 11:00, คาบ 5 = 12:00',
+  '  เมื่อระบุคาบมาแล้ว ถือว่าระบุเวลาแล้ว ห้ามใช้ 09:00 เป็นค่าเริ่มต้น',
+  '  ถ้า "คาบ N" มากับชื่อวันในสัปดาห์ ให้ใส่เวลานั้นใน time_of_day (เช่น คาบ 3 → "10:00")',
+  '  ถ้า "คาบ N" มากับวันที่ระบุตรง ๆ ให้ใส่เวลานั้นใน deadline_iso ตามปกติ',
   '- ถ้าไม่ได้ระบุเวลา ให้ใช้ 09:00 ของวันนั้น',
   '- category: หนึ่งใน "เรียน", "งาน", "ส่วนตัว", "สุขภาพ", "การเงิน" หรือ null ถ้าไม่ชัด',
-  '- confident: false ถ้าข้อความไม่ใช่การสั่งงาน/ไม่มีกำหนดเวลาที่พอจะเดาได้',
+  '- confident: false ถ้าข้อความไม่ใช่การสั่งงาน หรือเป็นงานครั้งเดียวที่ไม่มีกำหนดเวลาที่พอจะเดาได้',
 ].join('\n');
 
 const RESPONSE_SCHEMA = {
   type: 'OBJECT',
   properties: {
     title: { type: 'STRING' },
-    deadline_iso: { type: 'STRING' },
+    // Nullable and no longer required: a standing ("ทุกวัน") reminder has no
+    // deadline at all. finalizeResult still rejects a missing deadline on the
+    // non-recurring path, so the default behaviour is unchanged.
+    deadline_iso: { type: 'STRING', nullable: true },
+    // Symbolic weekday slot. The model names the day, finalizeResult resolves
+    // the actual date via resolveWeekday() — nullable and NOT required, so a
+    // message with no weekday reference is unaffected.
+    relative_weekday: { type: 'STRING', nullable: true },
+    weekday_qualifier: { type: 'STRING', nullable: true },
+    time_of_day: { type: 'STRING', nullable: true },
     category: { type: 'STRING', nullable: true },
+    recurring: { type: 'BOOLEAN' },
     confident: { type: 'BOOLEAN' },
   },
-  required: ['title', 'deadline_iso', 'confident'],
+  required: ['title', 'recurring', 'confident'],
 };
 
 const DAY_RULES = [
@@ -140,30 +187,61 @@ function extractJson(text) {
 }
 
 /**
- * Turn a raw model response string into { title, deadlineIso (UTC), category }.
+ * Turn a raw model response string into
+ * { title, deadlineIso (UTC | null), category, recurring }.
  * Shared by both providers so the validation rules can never drift apart.
+ *
+ * `recurring` is opt-in and defaults to false: anything the model does not
+ * explicitly flag as a daily standing reminder keeps the original contract,
+ * deadline included, and still throws 'no_deadline' without one.
+ *
+ * Deadline precedence:
+ *   1. recurring === true            -> no deadline at all, every date slot ignored
+ *   2. a resolvable `relative_weekday` -> date computed HERE from `now`, and it
+ *      overrides any `deadline_iso` the model emitted alongside it (the model
+ *      often sends both, and only the symbolic slot is trustworthy — see the
+ *      note on resolveWeekday)
+ *   3. otherwise                     -> `deadline_iso` as before
+ *
+ * `now` is what the weekday resolution is measured against; it is threaded in
+ * from parseReminder so tests can pin it.
  */
-function finalizeResult(rawText, provider) {
+function finalizeResult(rawText, provider, now = new Date()) {
   const parsed = extractJson(rawText);
   if (!parsed) throw new ParseError('Model did not return JSON (' + provider + ')', 'bad_json');
   if (parsed.confident === false) throw new ParseError('Model not confident', 'low_confidence');
 
   const title = typeof parsed.title === 'string' ? parsed.title.trim() : '';
-  const deadlineIso = toUtcIso(parsed.deadline_iso);
+  const recurring = parsed.recurring === true;
+  const weekdayDate = recurring
+    ? null
+    : resolveWeekday(now, parsed.relative_weekday, parsed.weekday_qualifier);
+  const deadlineIso = weekdayDate
+    ? toUtcIso(withTimeOfDay(weekdayDate, parsed.time_of_day))
+    : toUtcIso(parsed.deadline_iso);
   if (!title) throw new ParseError('Missing title', 'no_title');
-  if (!deadlineIso) throw new ParseError('Missing or invalid deadline', 'no_deadline');
+  // A standing reminder is defined by having no deadline, so a stray one the
+  // model invented anyway is dropped rather than half-honoured.
+  if (!deadlineIso && !recurring) {
+    throw new ParseError('Missing or invalid deadline', 'no_deadline');
+  }
 
   const category =
     typeof parsed.category === 'string' && parsed.category.trim()
       ? parsed.category.trim().slice(0, 30)
       : null;
 
-  return { title: title.slice(0, 120), deadlineIso, category };
+  return {
+    title: title.slice(0, 120),
+    deadlineIso: recurring ? null : deadlineIso,
+    category,
+    recurring,
+  };
 }
 
 /**
  * Call Gemini and return the raw response text.
- * Now the fallback leg: reached only after Ox Alpha has already failed, so any
+ * Now the fallback leg: reached only after OpenRouter has already failed, so any
  * ParseError thrown here is terminal and surfaces to the user.
  */
 async function callGemini(prompt, { json = true } = {}) {
@@ -224,7 +302,7 @@ async function callGemini(prompt, { json = true } = {}) {
 
 /**
  * Call OpenRouter (OpenAI-compatible) and return the raw response text.
- * This is the primary leg. Ox Alpha has no structured-output schema, so
+ * This is the primary leg. Nemotron 3.5 Lightning has no structured-output schema, so
  * JSON-ness rests on the same SYSTEM_RULES instructions plus response_format,
  * with extractJson() as a net — and, failing that, the Gemini fallback.
  */
@@ -233,6 +311,13 @@ async function callOpenRouter(prompt, { json = true } = {}) {
     model: config.openrouter.model,
     messages: [{ role: 'user', content: prompt }],
     temperature: json ? 0 : 0.3,
+    // Nemotron 3.5 Lightning is a thinking model and reasons by default: a
+    // measured parse burned 1549 reasoning tokens over 82.7s, far past
+    // REQUEST_TIMEOUT_MS, so every call would time out into the Gemini
+    // fallback. Disabling reasoning brings the same parse to 2.8s. Note that
+    // `reasoning: { effort: 'low' }` is NOT enough — it was ignored (1406
+    // reasoning tokens, 68.9s); only `enabled: false` takes effect.
+    reasoning: { enabled: false },
   };
   if (json) body.response_format = { type: 'json_object' };
 
@@ -270,12 +355,13 @@ async function callOpenRouter(prompt, { json = true } = {}) {
 }
 
 /**
- * Parse a free-form Thai message into { title, deadlineIso (UTC), category }.
- * Ox Alpha is primary, Gemini is the fallback. Unlike the previous arrangement,
- * the fallback trigger is deliberately broad: Ox Alpha is an anonymous
- * stealth/preview model with no published rate limits or documented failure
- * modes, so we cannot assume it only fails as a 429. ANY ParseError out of the
- * Ox Alpha leg — 429, other 4xx/5xx, network, unusable JSON — re-runs the same
+ * Parse a free-form Thai message into
+ * { title, deadlineIso (UTC | null), category, recurring }.
+ * Nemotron 3.5 Lightning (free) is primary, Gemini is the fallback. The
+ * fallback trigger is deliberately broad: a free-tier OpenRouter model carries
+ * tight shared rate limits and can be deprecated or capacity-starved without
+ * notice, so we cannot assume it only fails as a 429. ANY ParseError out of the
+ * OpenRouter leg — 429, other 4xx/5xx, network, unusable JSON — re-runs the same
  * prompt through Gemini, which at least has a response schema to lean on.
  * The two exceptions:
  *   - a missing OPENROUTER_API_KEY is a config problem Gemini cannot fix, so it
@@ -290,11 +376,11 @@ function isKeyMissing(key) {
 }
 
 /**
- * Run one prompt through Ox Alpha, falling back to Gemini, and hand the raw
+ * Run one prompt through OpenRouter, falling back to Gemini, and hand the raw
  * response text to `finalize`. Both callers share this so the retry/timeout,
  * fallback-trigger and key-guard rules can never drift apart between them.
  *
- * `finalize` runs inside the try on purpose: an unusable response from Ox Alpha
+ * `finalize` runs inside the try on purpose: an unusable response from OpenRouter
  * is exactly the kind of failure the fallback exists to absorb.
  */
 async function runWithFallback({ label, prompt, finalize, json }) {
@@ -304,19 +390,19 @@ async function runWithFallback({ label, prompt, finalize, json }) {
 
   try {
     const result = finalize(await callOpenRouter(prompt, { json }), config.openrouter.model);
-    console.info('[' + label + '] served by ox-alpha (primary) (' + config.openrouter.model + ')');
+    console.info('[' + label + '] served by openrouter (primary) (' + config.openrouter.model + ')');
     return result;
   } catch (err) {
     const recoverable = err instanceof ParseError && err.code !== 'low_confidence';
     if (!recoverable) throw err;
     if (isKeyMissing(config.gemini.apiKey)) {
       console.warn(
-        '[' + label + '] ox-alpha failed (' + err.code + ') and no GEMINI_API_KEY — giving up'
+        '[' + label + '] openrouter (' + config.openrouter.model + ') failed (' + err.code + ') and no GEMINI_API_KEY — giving up'
       );
       throw err;
     }
     console.warn(
-      '[' + label + '] ox-alpha failed (' + err.code + '), falling back to ' + config.gemini.model
+      '[' + label + '] openrouter (' + config.openrouter.model + ') failed (' + err.code + '), falling back to ' + config.gemini.model
     );
     const result = finalize(await callGemini(prompt, { json }), config.gemini.model);
     console.debug('[' + label + '] served by gemini fallback (' + config.gemini.model + ')');
@@ -328,7 +414,9 @@ async function parseReminder(userText, now = new Date()) {
   return runWithFallback({
     label: 'parseReminder',
     prompt: buildPrompt(userText, now),
-    finalize: finalizeResult,
+    // Closed over `now` so the weekday resolution inside finalizeResult is
+    // measured against the same instant the prompt was grounded on.
+    finalize: (rawText, provider) => finalizeResult(rawText, provider, now),
     json: true,
   });
 }
@@ -390,4 +478,6 @@ async function chatReply(userText, history, now = new Date()) {
   });
 }
 
-module.exports = { parseReminder, summarizeDay, chatReply, ParseError };
+// finalizeResult is exported for tests only — it is the pure, network-free core
+// of the parse path, so its precedence rules can be checked without an API call.
+module.exports = { parseReminder, summarizeDay, chatReply, ParseError, finalizeResult };

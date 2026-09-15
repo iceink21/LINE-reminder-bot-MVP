@@ -12,27 +12,61 @@ const db = new Database(config.dbPath);
 db.pragma('journal_mode = WAL');
 
 // --- schema (static SQL, no interpolation anywhere in this file) ---
-const SCHEMA_SQL = [
+
+// Kept as its own constant because the deadline_iso migration below has to
+// rebuild this table from the exact same definition — SQLite cannot drop a
+// NOT NULL constraint in place, so the new table is created from this string
+// rather than from a second copy that could drift out of sync with it.
+const REMINDERS_TABLE_SQL = [
   'CREATE TABLE IF NOT EXISTS reminders (',
   '  id                  INTEGER PRIMARY KEY AUTOINCREMENT,',
   '  line_user_id        TEXT    NOT NULL,',
   '  title               TEXT    NOT NULL,',
-  // UTC ISO-8601, e.g. 2026-08-24T08:00:00.000Z
-  '  deadline_iso        TEXT    NOT NULL,',
+  // UTC ISO-8601, e.g. 2026-08-24T08:00:00.000Z — NULL for a standing
+  // ("ทุกวัน") reminder, which has no deadline at all and is nudged by the
+  // 06:00 digest instead of by the day/hour/due sweep.
+  '  deadline_iso        TEXT,',
   '  category            TEXT,',
-  // status: pending | done — the nightly classifier writes rows straight to
-  // 'pending', so there is no longer an unconfirmed/draft state.
+  // status: pending | done — the webhook writes rows straight to 'pending' as
+  // the message arrives, so there is no unconfirmed/draft state.
   "  status              TEXT    NOT NULL DEFAULT 'pending',",
+  // repeat: NULL (one-off, has a deadline) | 'daily' (standing, no deadline)
+  '  "repeat"             TEXT,',
   '  day_before_notified  INTEGER NOT NULL DEFAULT 0,',
   '  hour_before_notified INTEGER NOT NULL DEFAULT 0,',
   '  due_notified         INTEGER NOT NULL DEFAULT 0,',
   '  created_at           TEXT    NOT NULL',
   ');',
+].join('\n');
+
+// Separate from the table itself: a rebuild drops the old table and its indexes
+// along with it, so these have to be replayed afterwards.
+const REMINDERS_INDEX_SQL = [
   'CREATE INDEX IF NOT EXISTS idx_reminders_user_status',
   '  ON reminders (line_user_id, status, deadline_iso);',
   'CREATE INDEX IF NOT EXISTS idx_reminders_due',
   '  ON reminders (status, deadline_iso);',
-  // Raw inbound chat text, parked until the 00:00 classifier sweeps it.
+].join('\n');
+
+// Steps of the deadline_iso rebuild (see the migration block below), spelled out
+// as module-level constants so no SQL string is ever assembled at a call site.
+const RENAME_REMINDERS_SQL = 'ALTER TABLE reminders RENAME TO reminders_old';
+const COPY_REMINDERS_SQL = [
+  'INSERT INTO reminders (',
+  '  id, line_user_id, title, deadline_iso, category, status,',
+  '  day_before_notified, hour_before_notified, due_notified, created_at',
+  ')',
+  'SELECT',
+  '  id, line_user_id, title, deadline_iso, category, status,',
+  '  day_before_notified, hour_before_notified, due_notified, created_at',
+  'FROM reminders_old',
+].join('\n');
+const DROP_OLD_REMINDERS_SQL = 'DROP TABLE reminders_old';
+
+const SCHEMA_SQL = [
+  REMINDERS_TABLE_SQL,
+  REMINDERS_INDEX_SQL,
+  // Raw inbound chat text, kept as the source material for the 00:00 recap.
   'CREATE TABLE IF NOT EXISTS inbox_messages (',
   '  id           INTEGER PRIMARY KEY AUTOINCREMENT,',
   '  line_user_id TEXT    NOT NULL,',
@@ -68,25 +102,71 @@ const SCHEMA_SQL = [
 
 db.exec(SCHEMA_SQL);
 
+const remindersColumns = () => db.prepare('PRAGMA table_info(reminders)').all();
+
 // Migration: `dev.db` may predate the hour_before_notified column, and SQLite
 // has no `ADD COLUMN IF NOT EXISTS`, so check table_info before altering.
-const hasHourBeforeColumn = db
-  .prepare('PRAGMA table_info(reminders)')
-  .all()
-  .some((col) => col.name === 'hour_before_notified');
+// This one runs FIRST so the deadline_iso rebuild below can copy a column list
+// it knows is complete.
+const hasHourBeforeColumn = remindersColumns().some(
+  (col) => col.name === 'hour_before_notified'
+);
 if (!hasHourBeforeColumn) {
   db.prepare('ALTER TABLE reminders ADD COLUMN hour_before_notified INTEGER NOT NULL DEFAULT 0').run();
+}
+
+// Migration: `deadline_iso` used to be NOT NULL, which a standing ("ทุกวัน")
+// reminder cannot satisfy. Same table_info guard as above, but SQLite has no
+// ALTER COLUMN either — dropping a NOT NULL means rebuilding the table, so this
+// one is a full rename/create/copy/drop rather than an additive ALTER.
+//
+// Idempotent: on an already-migrated DB `notnull` is 0 and the whole block is
+// skipped. Rows are copied by EXPLICIT column name, never `SELECT *` — the live
+// dev.db has hour_before_notified appended last by the migration above, so its
+// physical column order does not match REMINDERS_TABLE_SQL and a positional
+// copy would silently shuffle the notify flags into the wrong columns.
+const deadlineIsNotNull = remindersColumns().some(
+  (col) => col.name === 'deadline_iso' && col.notnull === 1
+);
+if (deadlineIsNotNull) {
+  const rebuildReminders = db.transaction(() => {
+    db.exec(RENAME_REMINDERS_SQL);
+    db.exec(REMINDERS_TABLE_SQL);
+    db.exec(COPY_REMINDERS_SQL);
+    db.exec(DROP_OLD_REMINDERS_SQL);
+    // RENAME carried the old indexes over to reminders_old and DROP took them
+    // with it, so recreate them against the new table.
+    db.exec(REMINDERS_INDEX_SQL);
+  });
+  rebuildReminders();
+  console.log('[db] migrated reminders.deadline_iso to nullable (standing reminders)');
+}
+
+// Safety net for a DB that already had a nullable deadline_iso but predates the
+// `repeat` column — the rebuild above would have skipped it, so add it here.
+const hasRepeatColumn = remindersColumns().some((col) => col.name === 'repeat');
+if (!hasRepeatColumn) {
+  db.prepare('ALTER TABLE reminders ADD COLUMN "repeat" TEXT').run();
 }
 
 // --- prepared statements: every user-facing query is scoped by line_user_id ---
 const SQL = {
   insertPending:
-    'INSERT INTO reminders (line_user_id, title, deadline_iso, category, status, created_at) ' +
-    "VALUES (@line_user_id, @title, @deadline_iso, @category, 'pending', @created_at)",
+    'INSERT INTO reminders ' +
+    '(line_user_id, title, deadline_iso, category, "repeat", status, created_at) ' +
+    "VALUES (@line_user_id, @title, @deadline_iso, @category, @repeat, 'pending', @created_at)",
   getOwned: 'SELECT * FROM reminders WHERE id = ? AND line_user_id = ?',
   markDone:
     "UPDATE reminders SET status = 'done' " +
     "WHERE id = ? AND line_user_id = ? AND status = 'pending'",
+  // The three notify flags are reset here on purpose: an edit may have moved the
+  // deadline forward, and a row still carrying yesterday's flags would never be
+  // picked up by the day/hour/due sweep again.
+  updateReminder:
+    'UPDATE reminders SET title = @title, deadline_iso = @deadline_iso, ' +
+    'category = @category, "repeat" = @repeat, day_before_notified = 0, ' +
+    'hour_before_notified = 0, due_notified = 0 ' +
+    "WHERE id = @id AND line_user_id = @line_user_id AND status = 'pending'",
   remove: 'DELETE FROM reminders WHERE id = ? AND line_user_id = ?',
   listPending:
     "SELECT * FROM reminders WHERE line_user_id = ? AND status = 'pending' " +
@@ -142,15 +222,23 @@ const stmt = Object.fromEntries(
 
 /**
  * Insert a confirmed reminder; returns the new row id.
- * Called by the nightly classifier once a parked message has parsed cleanly —
- * there is no confirmation round-trip, so rows land as 'pending' immediately.
+ * Called by the webhook the moment an inbound message parses cleanly — there is
+ * no confirmation round-trip, so rows land as 'pending' immediately.
+ *
+ * Two shapes land here:
+ *   - one-off:   deadlineIso set, repeat null  — swept by the day/hour/due tick
+ *   - standing:  deadlineIso null, repeat 'daily' — nudged by the 06:00 digest
+ * The standing shape is deliberately invisible to findDue*: those queries all
+ * compare `deadline_iso <= ?`, and any comparison against NULL is NULL (never
+ * true) in SQLite, so a null deadline drops out without a WHERE-clause change.
  */
-function createPendingReminder({ lineUserId, title, deadlineIso, category }) {
+function createPendingReminder({ lineUserId, title, deadlineIso, category, repeat }) {
   const info = stmt.insertPending.run({
     line_user_id: lineUserId,
     title,
-    deadline_iso: deadlineIso,
+    deadline_iso: deadlineIso || null,
     category: category || null,
+    repeat: repeat || null,
     created_at: new Date().toISOString(),
   });
   return Number(info.lastInsertRowid);
@@ -159,6 +247,24 @@ function createPendingReminder({ lineUserId, title, deadlineIso, category }) {
 const getReminder = (id, lineUserId) => stmt.getOwned.get(id, lineUserId) || null;
 const markDone = (id, lineUserId) => stmt.markDone.run(id, lineUserId).changes > 0;
 const deleteReminder = (id, lineUserId) => stmt.remove.run(id, lineUserId).changes > 0;
+
+/**
+ * Rewrite a pending reminder in place, keeping its id so `/list` numbering and
+ * anything the user has already noted down stay valid. Restricted to 'pending'
+ * for the same reason as `markDone`: a closed task should not be quietly
+ * reopened by an edit — the caller tells the user to use a new message instead.
+ * Returns false when nothing matched (wrong owner, wrong id, or already done).
+ */
+function updateReminder({ id, lineUserId, title, deadlineIso, category, repeat }) {
+  return stmt.updateReminder.run({
+    id,
+    line_user_id: lineUserId,
+    title,
+    deadline_iso: deadlineIso || null,
+    category: category || null,
+    repeat: repeat || null,
+  }).changes > 0;
+}
 const listPending = (lineUserId) => stmt.listPending.all(lineUserId);
 
 /**
@@ -222,7 +328,7 @@ const flagDueNotified = (id) => stmt.flagDue.run(id);
 const flagDayBeforeNotified = (id) => stmt.flagDayBefore.run(id);
 const flagHourBeforeNotified = (id) => stmt.flagHourBefore.run(id);
 
-// --- inbox: raw chat text waiting for the nightly classifier ---
+// --- inbox: raw chat text waiting for the nightly recap ---
 
 /** Park one inbound message; `createdAt` is a UTC ISO string. */
 function saveInboxMessage({ lineUserId, text, createdAt }) {
@@ -298,6 +404,7 @@ module.exports = {
   getReminder,
   markDone,
   deleteReminder,
+  updateReminder,
   listPending,
   listPendingUserIds,
   findDueNow,

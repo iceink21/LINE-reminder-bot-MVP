@@ -9,6 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "test": "node --test \"test/**/*.test.js\"",
     "start": "node src/index.js",
     "dev": "nodemon src/index.js"
   },

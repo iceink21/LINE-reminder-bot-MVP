@@ -9,12 +9,28 @@ const { parseReminder, chatReply, ParseError } = require('./gemini');
 // across a few exchanges without letting the prompt grow unbounded.
 const CHAT_HISTORY_TURNS = 12;
 
-/** Match "/done 12" / "/delete 12" / "/list" — tolerant of extra spaces. */
-const COMMAND_RE = /^\/(list|done|delete|help)\b\s*(.*)$/i;
+/** Match "/done 12" / "/edit 12 ..." / "/list" — tolerant of extra spaces. */
+// The `s` flag matters for `/edit`: without it `(.*)$` stops at the first
+// newline, the whole match fails, and a multi-line edit falls through to
+// handleFreeText — which creates a duplicate reminder instead of editing.
+const COMMAND_RE = /^\/(list|done|delete|edit|help)\b\s*(.*)$/is;
 
 function parseIdArg(arg) {
   const m = String(arg || '').trim().match(/^#?(\d+)$/);
   return m ? Number(m[1]) : null;
+}
+
+/**
+ * Split "12 ส่งรายงานพรุ่งนี้บ่าย 2" into its id and the rest.
+ * `/edit` is the only command whose argument is more than an id, so the id has
+ * to come off the front before `parseIdArg` (which anchors end-of-string) can be
+ * used. The `s` flag lets a multi-line new message through intact.
+ */
+function parseIdAndRest(arg) {
+  const m = String(arg || '').trim().match(/^#?(\d+)\s+(.+)$/s);
+  if (!m) return null;
+  const id = parseIdArg(m[1]);
+  return id === null ? null : { id, rest: m[2].trim() };
 }
 
 async function handleCommand(cmd, arg, userId, replyToken) {
@@ -24,6 +40,69 @@ async function handleCommand(cmd, arg, userId, replyToken) {
 
     case 'help':
       return reply(replyToken, msg.helpText());
+
+    case 'edit': {
+      const parts = parseIdAndRest(arg);
+      if (!parts) {
+        return reply(
+          replyToken,
+          msg.text(
+            'ใส่เลขที่รายการแล้วตามด้วยข้อความใหม่ด้วยนะ เช่น /edit 3 ส่งรายงานพรุ่งนี้บ่าย 2\n' +
+              'ดูเลขที่ได้จาก /list'
+          )
+        );
+      }
+      const { id, rest } = parts;
+
+      // Ownership check and the update itself are both scoped by userId.
+      const row = store.getReminder(id, userId);
+      if (!row) return reply(replyToken, msg.notFoundText(id));
+      if (row.status === 'done') {
+        return reply(
+          replyToken,
+          msg.text('รายการ #' + id + ' ปิดไปแล้ว แก้ไม่ได้นะ 😉\nถ้าจะทำใหม่ พิมพ์เป็นงานใหม่มาได้เลย')
+        );
+      }
+
+      let parsed;
+      try {
+        // One argument on purpose: the reference time for "พรุ่งนี้" in an edit is
+        // now, not whenever the original message was sent.
+        parsed = await parseReminder(rest);
+      } catch (err) {
+        if (!(err instanceof ParseError)) throw err;
+        // Unlike free text, a failed parse here must NOT fall through to chat —
+        // the user explicitly asked to edit, so say what went wrong instead.
+        return reply(
+          replyToken,
+          msg.text(
+            'ข้อความใหม่นี้ผมอ่านเป็นงานไม่ออกนะ 🤔\n' +
+              'ลองพิมพ์ให้ชัดขึ้น พร้อมวันเวลา เช่น /edit ' + id + ' ส่งรายงานพรุ่งนี้บ่าย 2'
+          )
+        );
+      }
+
+      const ok = store.updateReminder({
+        id,
+        lineUserId: userId,
+        title: parsed.title,
+        deadlineIso: parsed.deadlineIso,
+        category: parsed.category,
+        repeat: parsed.recurring ? 'daily' : null,
+      });
+      if (!ok) return reply(replyToken, msg.notFoundText(id));
+
+      return reply(
+        replyToken,
+        msg.editedText({
+          id,
+          title: parsed.title,
+          deadline_iso: parsed.deadlineIso,
+          category: parsed.category,
+          repeat: parsed.recurring ? 'daily' : null,
+        })
+      );
+    }
 
     case 'done':
     case 'delete': {
@@ -107,11 +186,15 @@ async function handleFreeText(text, userId, replyToken) {
     return replyAsChat(text, userId, replyToken);
   }
 
+  // A recurring parse has no deadline at all: it is stored with repeat='daily'
+  // and rides the 06:00 digest instead of the day/hour/due sweep, so it costs no
+  // extra push quota. `/done` and `/delete` stop it, same as any other row.
   const id = store.createPendingReminder({
     lineUserId: userId,
     title: parsed.title,
     deadlineIso: parsed.deadlineIso,
     category: parsed.category,
+    repeat: parsed.recurring ? 'daily' : null,
   });
   return reply(
     replyToken,
@@ -120,6 +203,7 @@ async function handleFreeText(text, userId, replyToken) {
       title: parsed.title,
       deadlineIso: parsed.deadlineIso,
       category: parsed.category,
+      recurring: parsed.recurring,
     })
   );
 }

@@ -37,7 +37,7 @@ const config = {
   // Primary provider.
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY || '',
-    model: process.env.OPENROUTER_MODEL || 'stealth/ox-alpha',
+    model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-lightning:free',
   },
   dbPath: resolveDbPath(process.env.DATABASE_URL),
   // All user-facing date handling is done in Thai local time.
@@ -60,7 +60,7 @@ function assertConfig() {
   }
   if (!config.gemini.apiKey || config.gemini.apiKey.startsWith('REPLACE_ME')) {
     console.warn(
-      '[config] GEMINI_API_KEY is not set to a real key — the fallback is disabled; any Ox Alpha failure will fail the parse.'
+      '[config] GEMINI_API_KEY is not set to a real key — the fallback is disabled; any OpenRouter failure will fail the parse.'
     );
   }
 }

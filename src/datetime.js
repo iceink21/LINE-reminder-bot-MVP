@@ -82,6 +82,124 @@ function relativeThai(iso, now = new Date()) {
 }
 
 /**
+ * Weekday name -> ECMAScript day index (Sunday = 0).
+ * Both the bare form ("จันทร์") and the "วัน"-prefixed form ("วันจันทร์") are
+ * accepted because the model emits both; "พฤหัส" is the common short form of
+ * "พฤหัสบดี" and is accepted for the same reason.
+ *
+ * The English names are here because the prompt asks for a bare Thai day name
+ * but nothing enforces that on the primary (schema-less) leg, and an
+ * unrecognised name costs the user their whole reminder: the slot resolves to
+ * null, the model was told not to send deadline_iso, finalizeResult throws
+ * 'no_deadline', and webhook.js answers with chit-chat instead of recording the
+ * task. Seven extra keys are cheap insurance against that silent drop.
+ */
+const WEEKDAY_INDEX = {
+  'อาทิตย์': 0,
+  'จันทร์': 1,
+  'อังคาร': 2,
+  'พุธ': 3,
+  'พฤหัสบดี': 4,
+  'พฤหัส': 4,
+  'ศุกร์': 5,
+  'เสาร์': 6,
+  // Lowercase — the lookup lowercases its key, which is a no-op for Thai.
+  sunday: 0,
+  monday: 1,
+  tuesday: 2,
+  wednesday: 3,
+  thursday: 4,
+  friday: 5,
+  saturday: 6,
+};
+
+/**
+ * Trailing qualifiers the model sometimes leaves attached to the day name when
+ * it echoes the user's own wording ("ศุกร์นี้", "วันศุกร์หน้า").
+ *
+ * "ที่แล้ว" means LAST (past) and stripping it still resolves to the next
+ * occurrence, which is a week-plus off. That is deliberate: a slightly wrong
+ * date the user can see and fix with /edit beats the alternative, which is the
+ * reminder never being recorded at all.
+ */
+const WEEKDAY_QUALIFIER_SUFFIX_RE = /(?:นี้|หน้า|ที่จะถึง|ที่แล้ว)$/;
+
+const TIME_OF_DAY_RE = /^(\d{1,2}):(\d{2})$/;
+
+/** Zero-pad to two digits. */
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+/**
+ * Resolve a symbolic relative weekday reference into a `YYYY-MM-DD` date.
+ *
+ * This exists because the parsing model is unreliable at weekday arithmetic:
+ * it emits the weekday NAME and we do the date math here, deterministically.
+ *
+ * Semantics (pinned — do not "fix"): "this", "next" and a null qualifier all
+ * resolve to the NEXT occurrence strictly after today, i.e. an offset of 1..7
+ * days; if today already is that weekday we skip a full week rather than
+ * returning today. Thai "จันทร์นี้" and "จันทร์หน้า" are used interchangeably in
+ * practice for the upcoming Monday, so treating "next" as +7 would produce a
+ * date a week later than the user means. The qualifier is carried in the JSON
+ * contract only so a future change of heart does not need a schema change.
+ *
+ * The weekday of "today" is read through tzParts, not Date#getDay(): between
+ * 00:00 and 07:00 ICT the UTC date is still the previous calendar day and a
+ * raw getDay() would be one weekday behind.
+ *
+ * @returns {string|null} `YYYY-MM-DD`, or null if the name is unrecognised.
+ */
+function resolveWeekday(now, weekdayName, _qualifier) {
+  if (typeof weekdayName !== 'string') return null;
+  const key = weekdayName
+    .trim()
+    .replace(/^วัน/, '')
+    .replace(WEEKDAY_QUALIFIER_SUFFIX_RE, '')
+    .trim()
+    .toLowerCase();
+  // Own-property check: "constructor"/"toString" etc. must not resolve.
+  const target = Object.prototype.hasOwnProperty.call(WEEKDAY_INDEX, key)
+    ? WEEKDAY_INDEX[key]
+    : undefined;
+  if (target === undefined) return null;
+
+  const date = now instanceof Date ? now : new Date(now);
+  if (Number.isNaN(date.getTime())) return null;
+  const p = tzParts(date);
+  // Anchor the local calendar date at UTC midnight so day arithmetic is plain
+  // integer arithmetic with no DST/offset drift.
+  const anchor = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day));
+
+  const current = new Date(anchor).getUTCDay();
+  // 1..7, never 0 — see the semantics note above.
+  const offset = ((target - current + 7) % 7) || 7;
+  const resolved = new Date(anchor + offset * 86400000);
+  return (
+    resolved.getUTCFullYear() +
+    '-' + pad2(resolved.getUTCMonth() + 1) +
+    '-' + pad2(resolved.getUTCDate())
+  );
+}
+
+/**
+ * Join a `YYYY-MM-DD` with an optional "HH:MM" into the string toUtcIso() takes.
+ * A missing or malformed time is dropped so that toUtcIso's own 09:00 ICT
+ * default applies — the default lives in exactly one place.
+ */
+function withTimeOfDay(dateStr, timeOfDay) {
+  if (typeof timeOfDay !== 'string') return dateStr;
+  const m = timeOfDay.trim().match(TIME_OF_DAY_RE);
+  if (!m) return dateStr;
+  const hour = Number(m[1]);
+  const minute = Number(m[2]);
+  // The regex alone still admits "97:99", which would make an Invalid Date.
+  if (hour > 23 || minute > 59) return dateStr;
+  return dateStr + 'T' + pad2(hour) + ':' + pad2(minute) + ':00';
+}
+
+/**
  * Normalise whatever Gemini returned into a UTC ISO string.
  * A timestamp without an offset is read as Thai local time, not UTC.
  */
@@ -102,4 +220,6 @@ module.exports = {
   formatThai,
   relativeThai,
   toUtcIso,
+  resolveWeekday,
+  withTimeOfDay,
 };
