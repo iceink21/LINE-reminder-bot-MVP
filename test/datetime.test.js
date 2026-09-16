@@ -14,7 +14,12 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { resolveWeekday, withTimeOfDay, toUtcIso } = require('../src/datetime');
+const {
+  resolveWeekday,
+  resolveBareWeekReference,
+  withTimeOfDay,
+  toUtcIso,
+} = require('../src/datetime');
 const { finalizeResult, ParseError } = require('../src/gemini');
 
 // -----------------------------------------------------------------------------
@@ -143,15 +148,19 @@ test('resolveWeekday: bare "อาทิตย์หน้า" still resolves to
   // normal speech means "next WEEK", not "next Sunday" — so resolving it to
   // Sunday can fire a reminder up to six days early.
   //
-  // That collision is handled in the PROMPT (SYSTEM_RULES in gemini.js), which
-  // tells the model to leave relative_weekday null for the bare form and send a
-  // deadline_iso instead. resolveWeekday keeps mapping it to Sunday on purpose:
-  // it is the right fallback for the case where the slot does get filled anyway
-  // (a wrong-ish date the user can see and /edit beats a dropped task).
+  // That collision is NOT resolveWeekday's job: by the time a name reaches it,
+  // the user's "วัน" prefix is long gone. It is handled one layer up, in
+  // finalizeResult, via resolveBareWeekReference() reading the RAW USER TEXT —
+  // which overrides this function's answer for the bare form. (The earlier
+  // prompt-layer attempt failed live 0/3 on 2026-09-16; see gemini.js.)
+  //
+  // resolveWeekday keeps mapping a bare "อาทิตย์หน้า" NAME to Sunday on purpose:
+  // it is the right fallback for a slot filled with that name when the user text
+  // did not actually contain the bare-week phrasing.
   //
   // This test pins that fallback so any future change to it is deliberate, not
   // an accident. If you intend to change it, change this test too — and check
-  // the prompt rule and the README note next to it.
+  // the finalizeResult precedence tests below.
   assert.strictEqual(resolveWeekday(NOW_ICT_WED, 'อาทิตย์หน้า', 'next'), '2026-09-20');
   assert.strictEqual(resolveWeekday(NOW_ICT_WED, 'อาทิตย์นี้', 'this'), '2026-09-20');
   // The unambiguous "วัน"-prefixed form genuinely means Sunday and must agree.
@@ -483,4 +492,202 @@ test('finalizeResult: defaults `now` to the current time when not threaded', () 
   );
   assert.match(out.deadlineIso, /^\d{4}-\d{2}-\d{2}T/);
   assert.ok(new Date(out.deadlineIso).getTime() > Date.now());
+});
+
+// -----------------------------------------------------------------------------
+// Bare "next week" reference ("อาทิตย์หน้า" / "สัปดาห์หน้า").
+//
+// Regression cover for the live failure of 2026-09-16, where the carve-out lived
+// in the prompt and scored 0/3 against nvidia/nemotron-3.5-lightning:free:
+//   rep 1  -> relative_weekday=null, deadline_iso=null  -> 'no_deadline' throw
+//   rep 2,3-> relative_weekday="อาทิตย์"                 -> Sunday, up to 6d early
+// Both reps are reproduced below as model output, with `now` pinned to the same
+// Wednesday the rest of this file uses (2026-09-16 ICT). Correct answer for both
+// is +7 days = 2026-09-23.
+// -----------------------------------------------------------------------------
+
+test('resolveBareWeekReference: bare forms resolve to +7 days from the ICT day', () => {
+  // The pin is 01:30 ICT on Wed 2026-09-16 while UTC still reads Tue 15 Sep —
+  // so a +7 built from the UTC date would answer 2026-09-22, one day short.
+  assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, 'ส่งงานอาทิตย์หน้า'), '2026-09-23');
+  assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, 'ส่งงานอาทิตย์ที่จะถึง'), '2026-09-23');
+  assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, 'ส่งงานสัปดาห์หน้า'), '2026-09-23');
+  assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, 'ส่งงานสัปดาห์ที่จะถึง'), '2026-09-23');
+  // Tolerated spacing.
+  assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, 'ส่งงาน อาทิตย์ หน้า'), '2026-09-23');
+});
+
+test('resolveBareWeekReference: a "วัน" prefix means Sunday, so it must NOT match', () => {
+  for (const text of [
+    'ส่งงานวันอาทิตย์หน้า',
+    'ส่งงานวัน อาทิตย์หน้า', // tolerated space between "วัน" and the day name
+    'ส่งงานวันอาทิตย์ที่จะถึง',
+  ]) {
+    assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, text), null, text);
+  }
+});
+
+test('resolveBareWeekReference: "นี้" (this week) is deliberately out of scope', () => {
+  // "อาทิตย์นี้" has no single obvious target date, so no date is invented for
+  // it — existing behaviour is left alone. See the note in datetime.js.
+  assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, 'ส่งงานอาทิตย์นี้'), null);
+  assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, 'ส่งงานสัปดาห์นี้'), null);
+});
+
+test('resolveBareWeekReference: unrelated text and bad input return null', () => {
+  for (const text of [
+    'ส่งงานวันศุกร์นี้',
+    'ส่งงานพรุ่งนี้',
+    'กินยาทุกวัน',
+    '',
+    null,
+    undefined,
+    42,
+    {},
+  ]) {
+    assert.strictEqual(resolveBareWeekReference(NOW_ICT_WED, text), null, JSON.stringify(text));
+  }
+  assert.strictEqual(resolveBareWeekReference(new Date('nonsense'), 'อาทิตย์หน้า'), null);
+});
+
+test('resolveBareWeekReference: the 00:00-07:00 ICT boundary uses the ICT calendar day', () => {
+  // 2026-09-15T17:00:00Z = 2026-09-16 00:00 ICT exactly. +7d = 2026-09-23.
+  assert.strictEqual(
+    resolveBareWeekReference(new Date('2026-09-15T17:00:00Z'), 'อาทิตย์หน้า'),
+    '2026-09-23'
+  );
+  // 2026-09-15T23:59:00Z = 2026-09-16 06:59 ICT, still inside the window.
+  assert.strictEqual(
+    resolveBareWeekReference(new Date('2026-09-15T23:59:00Z'), 'อาทิตย์หน้า'),
+    '2026-09-23'
+  );
+  // 2026-09-16T00:01:00Z = 07:01 ICT the same day — outside the window, and the
+  // answer must be identical. If it differs, the UTC date leaked in.
+  assert.strictEqual(
+    resolveBareWeekReference(new Date('2026-09-16T00:01:00Z'), 'อาทิตย์หน้า'),
+    '2026-09-23'
+  );
+  // And a month rollover through the same window: 2026-09-30T18:30:00Z is
+  // 2026-10-01 01:30 ICT, so +7d is 2026-10-08.
+  assert.strictEqual(
+    resolveBareWeekReference(new Date('2026-09-30T18:30:00Z'), 'สัปดาห์หน้า'),
+    '2026-10-08'
+  );
+});
+
+test('finalizeResult: rep-1 regression — both model date slots null -> +7d, not a throw', () => {
+  const out = finalizeResult(
+    raw({ ...base, deadline_iso: null, relative_weekday: null, weekday_qualifier: null, time_of_day: null }),
+    'test',
+    NOW_ICT_WED,
+    'ส่งงานอาทิตย์หน้า'
+  );
+  assert.strictEqual(out.deadlineIso, at0900('2026-09-23'));
+});
+
+test('finalizeResult: rep-2/3 regression — relative_weekday="อาทิตย์" is overridden by +7d', () => {
+  const out = finalizeResult(
+    raw({
+      ...base,
+      deadline_iso: null,
+      relative_weekday: 'อาทิตย์',
+      weekday_qualifier: 'next',
+      time_of_day: null,
+    }),
+    'test',
+    NOW_ICT_WED,
+    'ส่งงานอาทิตย์หน้า'
+  );
+  assert.strictEqual(out.deadlineIso, at0900('2026-09-23'));
+  assert.notStrictEqual(out.deadlineIso, at0900('2026-09-20')); // NOT Sunday
+});
+
+test('finalizeResult: the bare-week rule also overrides a model-computed deadline_iso', () => {
+  const out = finalizeResult(
+    raw({
+      ...base,
+      // The model doing date arithmetic — exactly what this design stopped trusting.
+      deadline_iso: '2026-09-20T09:00:00+07:00',
+      relative_weekday: 'อาทิตย์',
+      weekday_qualifier: 'next',
+      time_of_day: null,
+    }),
+    'test',
+    NOW_ICT_WED,
+    'ส่งงานสัปดาห์หน้า'
+  );
+  assert.strictEqual(out.deadlineIso, at0900('2026-09-23'));
+});
+
+test('finalizeResult: carve-out must not over-fire on "วันอาทิตย์หน้า" -> Sunday 2026-09-20', () => {
+  const out = finalizeResult(
+    raw({
+      ...base,
+      deadline_iso: null,
+      relative_weekday: 'อาทิตย์',
+      weekday_qualifier: 'next',
+      time_of_day: null,
+    }),
+    'test',
+    NOW_ICT_WED,
+    'ส่งงานวันอาทิตย์หน้า'
+  );
+  assert.strictEqual(out.deadlineIso, at0900('2026-09-20'));
+});
+
+test('finalizeResult: a bare-week phrase with a time keeps that time', () => {
+  const out = finalizeResult(
+    raw({
+      ...base,
+      deadline_iso: null,
+      relative_weekday: 'อาทิตย์',
+      weekday_qualifier: 'next',
+      time_of_day: '15:00',
+    }),
+    'test',
+    NOW_ICT_WED,
+    'ส่งงานอาทิตย์หน้าบ่าย 3 โมง'
+  );
+  assert.strictEqual(out.deadlineIso, toUtcIso('2026-09-23T15:00:00'));
+});
+
+test('finalizeResult: an ordinary weekday phrase is untouched by the carve-out', () => {
+  // "ส่งรายงานศุกร์นี้บ่าย 3 โมง" -> Fri 2026-09-18 15:00 ICT.
+  const out = finalizeResult(
+    raw({
+      ...base,
+      title: 'ส่งรายงาน',
+      deadline_iso: null,
+      relative_weekday: 'ศุกร์',
+      weekday_qualifier: 'this',
+      time_of_day: '15:00',
+    }),
+    'test',
+    NOW_ICT_WED,
+    'ส่งรายงานศุกร์นี้บ่าย 3 โมง'
+  );
+  assert.strictEqual(out.deadlineIso, toUtcIso('2026-09-18T15:00:00'));
+  assert.strictEqual(out.deadlineIso, '2026-09-18T08:00:00.000Z'); // 15:00 ICT - 7h
+});
+
+test('finalizeResult: recurring still outranks the bare-week rule', () => {
+  const out = finalizeResult(
+    raw({ title: 'กินยา', recurring: true, confident: true, deadline_iso: null }),
+    'test',
+    NOW_ICT_WED,
+    'กินยาทุกวัน เริ่มอาทิตย์หน้า'
+  );
+  assert.strictEqual(out.deadlineIso, null);
+  assert.strictEqual(out.recurring, true);
+});
+
+test('finalizeResult: omitting userText leaves the old behaviour exactly as it was', () => {
+  // Signature compatibility: the 3-arg call sites in this file and in the live
+  // harness must keep resolving through relative_weekday.
+  const out = finalizeResult(
+    raw({ ...base, deadline_iso: null, relative_weekday: 'อาทิตย์', weekday_qualifier: 'next', time_of_day: null }),
+    'test',
+    NOW_ICT_WED
+  );
+  assert.strictEqual(out.deadlineIso, at0900('2026-09-20'));
 });

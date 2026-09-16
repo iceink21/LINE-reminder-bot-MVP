@@ -6,6 +6,7 @@ const {
   thaiWeekday,
   toUtcIso,
   resolveWeekday,
+  resolveBareWeekReference,
   withTimeOfDay,
 } = require('./datetime');
 
@@ -64,15 +65,24 @@ const SYSTEM_RULES = [
   '  weekday_qualifier = "this" ถ้าผู้ใช้พูดว่า "...นี้", "next" ถ้าพูดว่า "...หน้า", ไม่ชัดให้ null',
   '  time_of_day = เวลาในรูป "HH:MM" แบบ 24 ชั่วโมง ถ้าผู้ใช้ระบุเวลา ไม่ระบุให้ null',
   '  ระบบจะคำนวณวันที่จริงให้เอง ไม่ต้องคิดแทน',
-  // "อาทิตย์" is both "Sunday" and "week". Bare "อาทิตย์หน้า" almost always
-  // means NEXT WEEK, and letting it fill the symbolic slot would fire the
-  // reminder on Sunday — up to six days early. Disambiguated here, at the
-  // prompt, because only the prompt still sees the user's original wording.
-  '- คำว่า "อาทิตย์" ภาษาไทยหมายได้ทั้ง "วันอาทิตย์" และ "สัปดาห์" ให้แยกตามการมี "วัน" นำหน้า',
-  '  ถ้าผู้ใช้พูดว่า "อาทิตย์หน้า"/"อาทิตย์นี้" โดยไม่มี "วัน" นำหน้า ให้ถือว่าหมายถึงสัปดาห์ ไม่ใช่วันอาทิตย์',
-  '  กรณีนี้ห้ามใส่ relative_weekday (ให้เป็น null) แต่ให้คำนวณวันที่แล้วใส่ deadline_iso ตามปกติ',
-  '  ส่วน "วันอาทิตย์หน้า"/"วันอาทิตย์นี้" (มี "วัน" นำหน้า) หมายถึงวันอาทิตย์จริง ๆ',
+  // "อาทิตย์" is both "Sunday" and "week". The earlier version of this rule
+  // asked the model to tell the two apart AND to compute the date itself for
+  // the bare "next week" reading. It FAILED live 0/3 on 2026-09-16
+  // (nvidia/nemotron-3.5-lightning:free, temperature 0, quota confirmed): one
+  // rep returned relative_weekday=null AND deadline_iso=null, losing the
+  // reminder to 'no_deadline'; two reps filled relative_weekday="อาทิตย์" —
+  // the same value the real-Sunday phrasing produces — firing up to six days
+  // early. It was also self-contradictory: it handed weekday arithmetic back
+  // to the model, which is exactly what the symbolic slot exists to avoid.
+  // The decision now lives entirely in code (resolveBareWeekReference), keyed
+  // off the raw user text, and OVERRIDES both date slots. Do not re-litigate
+  // this at the prompt layer. What is left below is only a nudge that keeps
+  // the model's output harmless whichever slot it fills.
+  '- คำว่า "อาทิตย์" ภาษาไทยหมายได้ทั้ง "วันอาทิตย์" และ "สัปดาห์"',
+  '  ถ้ามี "วัน" นำหน้า ("วันอาทิตย์หน้า") หมายถึงวันอาทิตย์จริง ๆ',
   '  ให้ใช้ relative_weekday = "อาทิตย์" และ deadline_iso = null ตามกฎชื่อวันข้างบน',
+  '  ถ้าไม่มี "วัน" นำหน้า ("อาทิตย์หน้า") หมายถึง "สัปดาห์หน้า" ระบบจะคำนวณวันที่ให้เอง',
+  '  กรณีนี้จะใส่หรือไม่ใส่ relative_weekday ก็ได้ ไม่ต้องกังวล ระบบไม่ได้ใช้ค่านั้น',
   '- ถ้าไม่ได้อ้างชื่อวันในสัปดาห์ ให้ relative_weekday, weekday_qualifier, time_of_day เป็น null ทั้งหมด',
   '- "บ่าย 3 โมง" = 15:00; "ทุ่ม" = 19:00 + n',
   '- "คาบ N" (คาบเรียนที่ N) = เวลาเริ่มคาบนั้น คิดจาก 08:00 แล้วบวก (N-1) ชั่วโมง',
@@ -197,27 +207,40 @@ function extractJson(text) {
  *
  * Deadline precedence:
  *   1. recurring === true            -> no deadline at all, every date slot ignored
- *   2. a resolvable `relative_weekday` -> date computed HERE from `now`, and it
+ *   2. a bare "next week" reference in the RAW USER TEXT ("อาทิตย์หน้า",
+ *      "สัปดาห์หน้า") -> now + 7 days, computed HERE, overriding BOTH model date
+ *      slots. It has to override rather than merely suppress relative_weekday:
+ *      live reps showed the model sending deadline_iso=null alongside, so
+ *      suppression alone loses the reminder to 'no_deadline'. See the note on
+ *      resolveBareWeekReference for the failed prompt-layer attempt.
+ *   3. a resolvable `relative_weekday` -> date computed HERE from `now`, and it
  *      overrides any `deadline_iso` the model emitted alongside it (the model
  *      often sends both, and only the symbolic slot is trustworthy — see the
  *      note on resolveWeekday)
- *   3. otherwise                     -> `deadline_iso` as before
+ *   4. otherwise                     -> `deadline_iso` as before
  *
  * `now` is what the weekday resolution is measured against; it is threaded in
- * from parseReminder so tests can pin it.
+ * from parseReminder so tests can pin it. `userText` is the USER's original
+ * message (not the model's response, which is `rawText`) and is likewise
+ * threaded in from parseReminder; it is optional and trailing so existing call
+ * sites keep working — omitting it simply disables rule 2.
  */
-function finalizeResult(rawText, provider, now = new Date()) {
+function finalizeResult(rawText, provider, now = new Date(), userText = '') {
   const parsed = extractJson(rawText);
   if (!parsed) throw new ParseError('Model did not return JSON (' + provider + ')', 'bad_json');
   if (parsed.confident === false) throw new ParseError('Model not confident', 'low_confidence');
 
   const title = typeof parsed.title === 'string' ? parsed.title.trim() : '';
   const recurring = parsed.recurring === true;
-  const weekdayDate = recurring
+  // Rule 2 before rule 3: the bare-week reading is decided from the user's own
+  // wording, which is strictly better evidence than either model date slot.
+  const bareWeekDate = recurring ? null : resolveBareWeekReference(now, userText);
+  const weekdayDate = recurring || bareWeekDate
     ? null
     : resolveWeekday(now, parsed.relative_weekday, parsed.weekday_qualifier);
-  const deadlineIso = weekdayDate
-    ? toUtcIso(withTimeOfDay(weekdayDate, parsed.time_of_day))
+  const computedDate = bareWeekDate || weekdayDate;
+  const deadlineIso = computedDate
+    ? toUtcIso(withTimeOfDay(computedDate, parsed.time_of_day))
     : toUtcIso(parsed.deadline_iso);
   if (!title) throw new ParseError('Missing title', 'no_title');
   // A standing reminder is defined by having no deadline, so a stray one the
@@ -415,8 +438,11 @@ async function parseReminder(userText, now = new Date()) {
     label: 'parseReminder',
     prompt: buildPrompt(userText, now),
     // Closed over `now` so the weekday resolution inside finalizeResult is
-    // measured against the same instant the prompt was grounded on.
-    finalize: (rawText, provider) => finalizeResult(rawText, provider, now),
+    // measured against the same instant the prompt was grounded on, and over
+    // `userText` so the bare "อาทิตย์หน้า" / "สัปดาห์หน้า" reading can be decided
+    // from the user's original wording — the model's response no longer carries
+    // that distinction.
+    finalize: (rawText, provider) => finalizeResult(rawText, provider, now, userText),
     json: true,
   });
 }

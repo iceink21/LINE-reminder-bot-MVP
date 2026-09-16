@@ -184,6 +184,53 @@ function resolveWeekday(now, weekdayName, _qualifier) {
 }
 
 /**
+ * Thai "อาทิตย์" means BOTH "Sunday" and "week", and the two readings are told
+ * apart by a "วัน" prefix: "วันอาทิตย์หน้า" = next Sunday, bare "อาทิตย์หน้า" =
+ * next WEEK. Only the raw user text still carries that distinction — by the time
+ * the model has answered, both phrasings arrive as relative_weekday="อาทิตย์".
+ *
+ * The prompt-layer version of this carve-out (tell the model to leave the slot
+ * null and compute deadline_iso itself for the bare form) was tried and FAILED
+ * live 0/3 on 2026-09-16: one rep returned both date slots null (reminder lost
+ * to 'no_deadline'), two reps filled relative_weekday="อาทิตย์" anyway (reminder
+ * up to six days early). Do not re-litigate it at the prompt. The decision is
+ * owned here, in code, which is the same principle resolveWeekday() exists for.
+ *
+ * Matching rules:
+ *   - "อาทิตย์หน้า" / "อาทิตย์ที่จะถึง" NOT immediately preceded by "วัน"
+ *     (an optional space is tolerated: "วัน อาทิตย์หน้า" is still Sunday)
+ *   - "สัปดาห์หน้า" / "สัปดาห์ที่จะถึง", which is unambiguously a week
+ *
+ * SCOPE: "หน้า" (next) only. "อาทิตย์นี้" / "สัปดาห์นี้" ("this week") has no
+ * single obvious target date — picking one would be inventing a deadline — so it
+ * is deliberately out of scope and keeps its existing behaviour.
+ *
+ * @returns {string|null} `YYYY-MM-DD`, exactly 7 days after the ICT calendar
+ *   date of `now`, or null when the pattern does not apply.
+ */
+const BARE_WEEK_REFERENCE_RE =
+  /(?:(?<!วัน\s?)อาทิตย์|สัปดาห์)\s?(?:หน้า|ที่จะถึง)/;
+
+function resolveBareWeekReference(now, userText) {
+  if (typeof userText !== 'string' || !userText) return null;
+  if (!BARE_WEEK_REFERENCE_RE.test(userText)) return null;
+
+  const date = now instanceof Date ? now : new Date(now);
+  if (Number.isNaN(date.getTime())) return null;
+  const p = tzParts(date);
+  // Same UTC-midnight anchor as resolveWeekday: between 00:00 and 07:00 ICT the
+  // UTC calendar day is still yesterday, so the local parts must come from
+  // tzParts rather than from the Date's own UTC/local getters.
+  const anchor = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day));
+  const resolved = new Date(anchor + 7 * 86400000);
+  return (
+    resolved.getUTCFullYear() +
+    '-' + pad2(resolved.getUTCMonth() + 1) +
+    '-' + pad2(resolved.getUTCDate())
+  );
+}
+
+/**
  * Join a `YYYY-MM-DD` with an optional "HH:MM" into the string toUtcIso() takes.
  * A missing or malformed time is dropped so that toUtcIso's own 09:00 ICT
  * default applies — the default lives in exactly one place.
@@ -221,5 +268,6 @@ module.exports = {
   relativeThai,
   toUtcIso,
   resolveWeekday,
+  resolveBareWeekReference,
   withTimeOfDay,
 };
