@@ -5,13 +5,28 @@ const { formatThai, relativeThai } = require('./datetime');
 const text = (t) => ({ type: 'text', text: t });
 
 /**
- * Last-resort reply when the message was not a task AND the chat call failed.
- * It must not promise a reminder later: anything that parses as one is already
- * a reminder by the time this string is reached. The midnight recap it points
- * at is real — that job runs off the inbox row, which was saved either way.
+ * Last-resort reply when the LLM could not be used for this message — either a
+ * provider failure on the parse leg, or a not-a-task message whose chat leg
+ * then failed too.
+ *
+ * It MUST say that nothing was scheduled. The old copy ("ตอนนี้ผมตอบยาว ๆ
+ * ไม่ไหวแป๊บนึง") only apologised for being brief, which reads as "noted, I've
+ * got it" — and once the OpenRouter balance runs out, EVERY dated task lands
+ * here and gets that cheerful ack with no reminder behind it. The user has to
+ * be told to send it again.
+ *
+ * The inbox row itself really was saved, and the midnight recap it points at
+ * really does run off that row, so both of those claims stay.
  */
 const inboxAckText = () =>
-  text('รับทราบ 📝\nตอนนี้ผมตอบยาว ๆ ไม่ไหวแป๊บนึง แต่เดี๋ยวสรุปบทสนทนาของวันนี้ให้ตอนเที่ยงคืนนะ');
+  text(
+    [
+      'รับทราบ 📝 เก็บข้อความไว้ในบันทึกของวันนี้แล้ว',
+      'แต่บอกตามตรงว่าตอนนี้ผมอ่านข้อความไม่ออกชั่วคราว เลย "ยังไม่ได้ตั้งเตือน" ให้นะ',
+      'ถ้าอันนี้เป็นงานที่มีกำหนดส่ง รบกวนพิมพ์ส่งมาใหม่อีกครั้ง เดี๋ยวจดให้',
+      'เช็กงานที่ค้างอยู่ได้ด้วย /list · เดี๋ยวสรุปบทสนทนาของวันนี้ให้ตอนเที่ยงคืนเหมือนเดิม',
+    ].join('\n')
+  );
 
 // Marker for a standing reminder — one that repeats every day and has no
 // deadline to count down to.

@@ -1,6 +1,6 @@
 # LINE Reminder Bot
 
-บอทเตือนความจำส่วนตัวบน LINE Official Account — พิมพ์อะไรมาก็ได้เป็นภาษาไทยธรรมดา บอทใช้ NVIDIA Nemotron 3.5 Lightning (free) (มี Gemini เป็น fallback) คัด **ทันทีที่ข้อความเข้ามา** ว่าเป็นงาน + กำหนดส่งหรือเปล่า ถ้าใช่บันทึกลง SQLite เป็น `pending` เลย (ไม่ต้องกดยืนยัน) แล้วตอบรับทราบด้วย reply ที่ไม่กินโควตา ถ้าไม่ใช่ก็คุยตอบกลับตามปกติ — ส่วน **ตอนเที่ยงคืน** เป็นแค่รอบ **สรุปบทสนทนา** ของวันนั้นเป็น push เดียวต่อคน
+บอทเตือนความจำส่วนตัวบน LINE Official Account — พิมพ์อะไรมาก็ได้เป็นภาษาไทยธรรมดา บอทใช้ inception/mercury-2.5 ผ่าน OpenRouter (มี Gemini เป็น fallback) คัด **ทันทีที่ข้อความเข้ามา** ว่าเป็นงาน + กำหนดส่งหรือเปล่า ถ้าใช่บันทึกลง SQLite เป็น `pending` เลย (ไม่ต้องกดยืนยัน) แล้วตอบรับทราบด้วย reply ที่ไม่กินโควตา ถ้าไม่ใช่ก็คุยตอบกลับตามปกติ — ส่วน **ตอนเที่ยงคืน** เป็นแค่รอบ **สรุปบทสนทนา** ของวันนั้นเป็น push เดียวต่อคน
 
 ## ทำอะไรได้บ้าง
 
@@ -29,7 +29,7 @@
 
 ### ชื่อวันในสัปดาห์: โมเดลบอก "ชื่อวัน" ระบบคำนวณ "วันที่" เอง
 
-`ศุกร์นี้` / `วันจันทร์หน้า` เคยพลาดบ่อย เพราะโมเดลคิดเลขวันที่เองแล้วตอบผิด (โมเดลที่ปิด reasoning ยิ่งพลาด) — ตอนนี้จึง **เอาโมเดลออกจากการคำนวณทั้งหมด**
+`ศุกร์นี้` / `วันจันทร์หน้า` เคยพลาดบ่อย เพราะโมเดลคิดเลขวันที่เองแล้วตอบผิด (ยิ่งโมเดลที่ปิด reasoning ยิ่งพลาด — สมัยที่ยังปิดอยู่) — ตอนนี้จึง **เอาโมเดลออกจากการคำนวณทั้งหมด**
 
 1. โมเดลตอบเป็น **สัญลักษณ์** แทนวันที่: `relative_weekday` (ชื่อวัน), `weekday_qualifier` (`"this"` / `"next"` / `null`), `time_of_day` (`"HH:MM"` / `null`) และให้ `deadline_iso` เป็น `null`
 2. `resolveWeekday(now, name, qualifier)` ใน `datetime.js` คำนวณวันที่จริงแบบ deterministic
@@ -56,6 +56,37 @@
 ### การสร้างงาน: เกิดสดตอนข้อความเข้า
 
 `webhook.js` เรียก `parseReminder(text)` ทันทีที่ข้อความมาถึง — ผ่านก็ `createPendingReminder()` แล้วตอบยืนยันด้วย reply (ฟรี ไม่กินโควตา), ไม่ผ่าน (รวมถึง `low_confidence`) ก็ตอบคุยเล่นกลับไป งานจึงโผล่ใน `/list` ตั้งแต่วินาทีที่พิมพ์ ไม่ต้องรอถึงเที่ยงคืน ส่วนข้อความดิบถูกบันทึกลง `inbox_messages` ทุกกรณี เพราะเป็นวัตถุดิบของรอบสรุปข้างล่าง
+
+### งบเวลาของการพาร์ส: เพดานคือ reply token ไม่ใช่ webhook
+
+`index.js` ตอบ `res.status(200).end()` **ก่อน** เรียก `handleEvent(event)` และจงใจไม่ `await` — การ ack กับการประมวลผลจึงแยกกันอยู่แล้ว ข้อจำกัด 1 วินาทีของ webhook จึงไม่เกี่ยวกับความเร็วของโมเดลเลย
+
+ตัวที่บีบจริงคือ **อายุของ LINE reply token: ~60 วินาที และใช้ได้ครั้งเดียว** ถ้าพาร์สเสร็จช้ากว่านั้น โทเคนตาย ผู้ใช้ไม่ได้รับอะไรเลย งบเวลาจึงถูกแยกเป็นสองก้อน:
+
+| งบ | ขอบเขต | ค่าเริ่มต้น | env |
+|---|---|---|---|
+| ขาหลัก | `callOpenRouter()` หนึ่งขา | 25,000 ms | `LLM_PRIMARY_TIMEOUT_MS` |
+| ขา fallback | `callGemini()` **ทั้งขา** รวม retry และ sleep ทุกครั้ง | 20,000 ms | `LLM_FALLBACK_TIMEOUT_MS` |
+| **ทั้งอีเวนต์** | **งาน LLM ทั้งหมดของ webhook event เดียว** | **45,000 ms** | `LLM_EVENT_BUDGET_MS` |
+
+ภายใน **หนึ่งเชน** กรณีแย่สุดเป็นแบบลำดับ: ขาหลัก timeout → ขา fallback ทำงาน → ยิง reply API รวม 45s
+
+แต่ `PRIMARY + FALLBACK` **ไม่ใช่** ข้อผูกมัดจริง และการคิดว่าใช่คือบั๊กที่เพิ่งแก้ไป — **หนึ่งอีเวนต์รันได้สองเชน**: `handleFreeText` เรียก `parseReminder` ก่อน ถ้าผลออกมาว่า "ไม่ใช่งาน" ก็เรียก `chatReply` ต่อ **บน reply token ใบเดิมที่ใช้เวลาไปแล้วส่วนหนึ่ง** 45s สองรอบ = 90s ชนเพดาน 60s (เพดาน 12s ใบเดียวของเดิมรอดมาได้เพราะบังเอิญ: 12×4 = 48s)
+
+ข้อผูกมัดจริงจึงเป็นเลขตัวที่สาม **งบต่ออีเวนต์**: `webhook.js` ตั้ง deadline หนึ่งค่าตอนรับอีเวนต์ แล้วส่งต่อไปทุก LLM call ของอีเวนต์นั้น แต่ละขาได้เวลา `min(งบของขาตัวเอง, เวลาที่เหลือของ deadline)` ฉะนั้น
+
+> `LLM_EVENT_BUDGET_MS + เวลายิง reply < 60s` ← **นี่คือสมการที่ `assertConfig()` ตรวจ**
+
+ค่าเริ่มต้น 45s + เผื่อ 10s = 55s เหลือขอบ ~5s (และ 45s เท่ากับ primary+fallback พอดีโดยตั้งใจ เชนเดียวจึงไม่เคยถูกตัดทอน สองเชน **แบ่งกันใช้** แทนที่จะบวกกัน)
+
+กฎอีกสองข้อที่บังคับในโค้ดด้วยเหตุผลเดียวกัน:
+
+1. **งบของขาหนึ่ง ๆ คลุมทั้งขา** ไม่ใช่ต่อ fetch — `AbortSignal.timeout()` เดิมถูกสร้าง *ข้างใน* ลูป retry ของ `callGemini()` ทำให้ขาที่เขียนว่า 20s วิ่งจริงได้ถึง ~76s (3 fetch × 20s + 2 sleep × 8s) ตอนนี้คำนวณ `legDeadline` ครั้งเดียวก่อนเข้าลูป แต่ละ attempt ได้เวลาที่เหลือ และถ้าเวลาที่เหลือไม่พอสำหรับ sleep + attempt ขั้นต่ำ ก็เลิก retry ทันที
+2. **ความล้มเหลวฝั่งผู้ให้บริการไม่เรียกเชนที่สอง** — `replyAsChat` จะทำงานเฉพาะตอนที่ผลพาร์สเป็นคำตัดสินเกี่ยวกับ *ข้อความของผู้ใช้* (`low_confidence`, `no_title`, `no_deadline`) ส่วน `network` (ซึ่งคือหน้าตาของ AbortSignal timeout), `http_402`, `http_503` ฯลฯ ตอบด้วย inbox ack ไปเลย — ยิง LLM ซ้ำตอนปลายทางล่มไม่ช่วยอะไร มีแต่ทำให้งบบานสองเท่า
+
+ทำไมไม่ย้ายไปส่งด้วย **push** แล้วตัดปัญหาอายุโทเคนทิ้ง: reply ฟรีและไม่จำกัด แต่ push จำกัด **200 ข้อความ/เดือน** (~6/วัน) การจ่ายโควตา push เพื่อซื้อเวลาที่หน้าต่าง reply 60 วินาทียังให้ฟรีอยู่แล้ว เป็นการถอยหลัง
+
+ถ้าเส้นทางช้าสุดเลย 60s จนโทเคนตายจริง `line.js` จะ log บรรทัด `REPLY TOKEN DEAD` แยกออกมาชัด ๆ (อาการฝั่งผู้ใช้คือ "บอทเงียบ") และ **จงใจไม่** fallback ไป push อัตโนมัติ — โควตา push เป็นของผู้ใช้ ต้องให้ผู้ใช้สั่งเอง
 
 ### รอบสรุปบทสนทนาเที่ยงคืน (00:00 Asia/Bangkok)
 
@@ -85,7 +116,7 @@ curl http://localhost:3000/usage   # {"month":"2026-08","count":12,"limit":200}
 src/
   index.js      Express app, /webhook (มี LINE signature middleware) + /health + /usage, บูต scheduler
   webhook.js    routing ของ event: command / free text (พาร์สเป็นงานสดทันที + เก็บลง inbox) / follow
-  gemini.js     เรียก Nemotron 3.5 Lightning (หลัก) / Gemini (fallback) — parseReminder + summarizeDay + chatReply
+  gemini.js     เรียก OpenRouter (หลัก, ค่าเริ่มต้น mercury-2.5) / Gemini (fallback) — parseReminder + summarizeDay + chatReply
   db.js         better-sqlite3: schema + prepared statement (scope ด้วย line_user_id ทุกคำสั่ง)
   scheduler.js  node-cron: sweep ทุกนาที + สรุปบทสนทนาเที่ยงคืน 00:00 + สรุปงานค้างประจำวัน 06:00
   messages.js   ข้อความภาษาไทยทั้งหมด
@@ -131,18 +162,36 @@ test/
 | `count` | INTEGER | นับเฉพาะ push ที่ LINE รับแล้ว (reply ไม่นับ) |
 | `warned` | INTEGER | 0/1 — ธงกันเตือนโควตาซ้ำในเดือนเดียวกัน |
 
+## เลือกโมเดลหลักยังไง (อัปเดต 2026-09-21)
+
+ตัวหลักคือ **`inception/mercury-2.5`** ผ่าน OpenRouter — เสียเงินแต่ถูก (~$0.00046/ครั้ง) วัดสดกับพรอมป์ไทยจริงความยาว 2,982 ตัวอักษร **9/9 รอบ ที่ 4.9–8.5s** พาร์สถูกทุกรอบ และ reasoning token นิ่ง (2,035–2,460 ไม่มีพุ่ง) ความนิ่งนี่แหละคือเหตุผลที่เลือก
+
+**`z-ai/glm-5.3-flash` ใช้ไม่ได้** (เคยตั้งเป็นตัวหลักช่วงสั้น ๆ วันเดียวกัน): มันคิด (reason) เป็นค่าเริ่มต้นแบบ **ปิดไม่ได้และไม่มีเพดาน** — `reasoning:{effort:'none'}` และ `reasoning:{max_tokens:0}` ตอบ HTTP 400 `"Reasoning is mandatory for this endpoint"` ทั้งคู่ พอเจอพรอมป์โปรดักชันจริง reasoning token พุ่งจาก 204 → 1024 แล้วเวลาไต่เป็น 8.2s / 12.9s / **29.1s**
+
+**อย่ากลับไปใช้ `:free` tier — ปิดประตูแล้ว.** วัดใหม่หลังถอดเพดาน 12s ออกด้วยซ้ำ ยังใช้ไม่ได้ 0/10: `nvidia/nemotron-3.5-lightning:free` timeout **5/5 ที่เพดาน 30 วินาที** (30069/30009/30009/30015/30006 ms — ไม่ใช่ช้า แต่ไม่เสิร์ฟ), `z-ai/glm-5.2:free` ตอบ HTTP 429 **5/5 ภายในไม่ถึงวินาที** สรุปคือ **การขยายงบเวลาไม่ช่วยโมเดลฟรี** รอบก่อนหน้านั้น (2026-09-15) nemotron ก็เคยล่มเงียบ ๆ แบบเดียวกัน: ฟิลด์ปิด reasoning ทำงานจริง (`reasoning_tokens: 0`) แต่คิวฝั่ง free tier อืดจนวัดได้ 12.9s / 19.4s / 54.9s และมีรอบค้าง 120s คืน body ว่างพร้อม HTTP 200 (รุ่นฟรีอื่นก็ไม่รอด: gemma-4-31b/26b, qwen3.8-27b → 429; liquid/lfm-2.5-2.6b, ling-3.0-flash-vl → 400; nex-n2.5-mini เร็วแต่หลอน)
+
+> ⚠️ **บัญชี OpenRouter ยังไม่ได้เติมเงิน** (`is_free_tier: true`, ใช้สะสม $0.0066) โมเดลเสียเงินส่วนใหญ่จึงตอบ HTTP 402 ตอนนี้ mercury-2.5 ยังวิ่งได้ด้วยยอดคงเหลือก้อนเล็ก ๆ — **ต้องเติมเครดิตเองเพื่อให้ใช้ได้ต่อ** เป็นงานมือของผู้ใช้ ไม่ใช่เรื่องที่แก้ด้วยโค้ด
+
+**ฝั่ง fallback (`gemini-3.6-flash`) ก็ไม่น่าไว้ใจ** — วัดสด 5 ครั้งได้ HTTP 503 `"model is overloaded"` **3 ใน 5** แก้จากฝั่งเราไม่ได้ ดังนั้น "ตกมาถึง fallback" ไม่เท่ากับ "ได้คำตอบ" ดู `KNOWN_ISSUES.md` (M-2)
+
+**ฟิลด์ `reasoning` ส่งตายตัวไม่ได้** หลายผู้ให้บริการตอบกลับเป็น HTTP 400 `"Reasoning is mandatory for this endpoint and cannot be disabled"` จึงเป็นสวิตช์ `OPENROUTER_DISABLE_REASONING` ที่ **ปิดไว้เป็นค่าเริ่มต้น** — mercury-2.5 คิดเป็นค่าเริ่มต้นและ **ปล่อยไว้แบบนั้นถูกแล้ว** เพราะ reasoning ของมันมีขอบเขตและนิ่ง เปลี่ยนโมเดลทีหลังจึงเป็นการแก้ config ไม่ใช่แก้โค้ด
+
 ## Environment variables
 
 | ตัวแปร | จำเป็น | ตัวอย่าง / ค่าเริ่มต้น |
 |---|---|---|
 | `LINE_CHANNEL_ACCESS_TOKEN` | ✅ | จาก LINE Developers Console → Messaging API |
 | `LINE_CHANNEL_SECRET` | ✅ | ใช้ตรวจ `x-line-signature` |
-| `OPENROUTER_API_KEY` | ✅ | ตัวแยกวิเคราะห์หลัก (NVIDIA Nemotron 3.5 Lightning free) จาก openrouter.ai |
+| `OPENROUTER_API_KEY` | ✅ | ตัวแยกวิเคราะห์หลัก (inception/mercury-2.5) จาก openrouter.ai — เสียเงินแต่ถูก ~$0.00046/ครั้ง **บัญชีต้องมีเครดิต** ไม่งั้นได้ HTTP 402 |
 | `DATABASE_URL` | — | `file:./dev.db` (รองรับทั้ง `file:` prefix และ path เปล่า) |
 | `PORT` | — | `3000` |
-| `OPENROUTER_MODEL` | — | `nvidia/nemotron-3.5-lightning:free` |
-| `GEMINI_API_KEY` | — | จาก Google AI Studio; ใช้เป็น fallback ทุกครั้งที่ Nemotron พลาด (429/4xx/5xx/เน็ตหลุด/JSON เสีย); ไม่ใส่ = ปิด fallback |
-| `GEMINI_MODEL` | — | `gemini-3.6-flash` |
+| `OPENROUTER_MODEL` | — | `inception/mercury-2.5` |
+| `OPENROUTER_DISABLE_REASONING` | — | `false` (ไม่ตั้ง = ไม่ส่งฟิลด์ `reasoning` เลย) ตั้งเป็น `true` ก็ต่อเมื่อเปลี่ยนไปใช้โมเดลที่คิดยาวจนเกินงบขาหลัก **และ** รับฟิลด์นี้ได้ — glm-5.3-flash ตอบ HTTP 400 ถ้าส่งไป ส่วน mercury-2.5 คิดเป็นปกติแต่มีขอบเขต ปล่อยปิดสวิตช์ไว้ |
+| `GEMINI_API_KEY` | — | จาก Google AI Studio; ใช้เป็น fallback ทุกครั้งที่ตัวหลักพลาด (429/4xx/5xx/เน็ตหลุด/JSON เสีย); ไม่ใส่ = ปิด fallback |
+| `GEMINI_MODEL` | — | `gemini-3.6-flash` (ขา fallback; ตอบ HTTP 503 บ่อย ดู M-2) |
+| `LLM_PRIMARY_TIMEOUT_MS` | — | `25000` งบของขาหลัก (หนึ่ง fetch) |
+| `LLM_FALLBACK_TIMEOUT_MS` | — | `20000` งบของขา fallback **ทั้งขา** รวม retry และ sleep ทุกครั้ง ไม่ใช่ต่อ attempt |
+| `LLM_EVENT_BUDGET_MS` | — | `45000` เพดานงาน LLM **ทั้งหมดของหนึ่ง webhook event** (หนึ่งอีเวนต์รันได้สองเชน) — **เลขนี้บวกเวลายิง reply ต้องน้อยกว่า 60s** ซึ่งเป็นอายุ reply token; เป็นสมการที่ `assertConfig()` ตรวจ |
 | `TZ_NAME` | — | `Asia/Bangkok` |
 | `PUSH_MONTHLY_LIMIT` | — | `200` (โควตา push/multicast/broadcast ของแพลนฟรี — reply ไม่นับ) |
 | `PUSH_WARN_RATIO` | — | `0.9` (แตะ 90% ของโควตาแล้วเตือนหนึ่งครั้ง) |

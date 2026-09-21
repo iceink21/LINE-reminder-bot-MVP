@@ -3,7 +3,13 @@
 const store = require('./db');
 const msg = require('./messages');
 const { reply } = require('./line');
-const { parseReminder, chatReply, ParseError } = require('./gemini');
+const {
+  parseReminder,
+  chatReply,
+  ParseError,
+  isProviderFailure,
+  newEventDeadline,
+} = require('./gemini');
 
 // How many past turns ride along in the chat prompt. Enough to hold a thread
 // across a few exchanges without letting the prompt grow unbounded.
@@ -33,7 +39,7 @@ function parseIdAndRest(arg) {
   return id === null ? null : { id, rest: m[2].trim() };
 }
 
-async function handleCommand(cmd, arg, userId, replyToken) {
+async function handleCommand(cmd, arg, userId, replyToken, deadline) {
   switch (cmd) {
     case 'list':
       return reply(replyToken, msg.listText(store.listPending(userId)));
@@ -68,7 +74,7 @@ async function handleCommand(cmd, arg, userId, replyToken) {
       try {
         // One argument on purpose: the reference time for "พรุ่งนี้" in an edit is
         // now, not whenever the original message was sent.
-        parsed = await parseReminder(rest);
+        parsed = await parseReminder(rest, new Date(), { deadline });
       } catch (err) {
         if (!(err instanceof ParseError)) throw err;
         // Unlike free text, a failed parse here must NOT fall through to chat —
@@ -139,14 +145,16 @@ async function handleCommand(cmd, arg, userId, replyToken) {
  * Only the chat turns are stored here — the raw inbox row was already written
  * by the caller, and the two logs serve different jobs.
  * A ParseError means the chat call itself failed; a canned ack beats silence,
- * and the nightly recap it mentions genuinely still runs.
+ * and the nightly recap it mentions genuinely still runs. Reached only for a
+ * verdict about the user's text — handleFreeText sends provider failures
+ * straight to the same ack without spending a second chain on them.
  */
-async function replyAsChat(text, userId, replyToken) {
+async function replyAsChat(text, userId, replyToken, deadline) {
   const history = store.getRecentChatHistory(userId, CHAT_HISTORY_TURNS);
 
   let chatText;
   try {
-    chatText = await chatReply(text, history, new Date());
+    chatText = await chatReply(text, history, new Date(), { deadline });
   } catch (err) {
     if (!(err instanceof ParseError)) throw err;
     return reply(replyToken, msg.inboxAckText());
@@ -169,7 +177,7 @@ async function replyAsChat(text, userId, replyToken) {
  * is the raw record the midnight job recaps the whole day's conversation from.
  * There is no draft/confirm step: a successful parse goes straight to 'pending'.
  */
-async function handleFreeText(text, userId, replyToken) {
+async function handleFreeText(text, userId, replyToken, deadline) {
   store.saveInboxMessage({
     lineUserId: userId,
     text,
@@ -178,12 +186,25 @@ async function handleFreeText(text, userId, replyToken) {
 
   let parsed;
   try {
-    parsed = await parseReminder(text);
+    parsed = await parseReminder(text, new Date(), { deadline });
   } catch (err) {
-    // A ParseError — including 'low_confidence' — just means this was not a
-    // task. Anything else is a real failure and belongs to handleEvent's catch.
+    // Two very different failures arrive here and they must NOT be treated
+    // alike. The earlier comment claimed any ParseError "just means this was
+    // not a task"; that is only true of a VERDICT about the user's text
+    // ('low_confidence', 'no_title', 'no_deadline'). A PROVIDER failure
+    // ('network' — which is what an AbortSignal timeout looks like — plus
+    // 'http_402', 'http_503' and the rest) means the model never read the
+    // message at all, and starting a second full LLM chain on the same,
+    // already-partly-spent reply token cannot help: the provider is down or
+    // hanging either way, and the second chain is exactly what doubled this
+    // event's timeout budget. So provider failures go straight to the inbox
+    // ack, which now says plainly that nothing was scheduled.
     if (!(err instanceof ParseError)) throw err;
-    return replyAsChat(text, userId, replyToken);
+    if (isProviderFailure(err)) {
+      console.warn('[webhook] parse failed provider-side (' + err.code + ') — skipping the chat chain');
+      return reply(replyToken, msg.inboxAckText());
+    }
+    return replyAsChat(text, userId, replyToken, deadline);
   }
 
   // A recurring parse has no deadline at all: it is stored with repeat='daily'
@@ -215,6 +236,10 @@ async function handleFreeText(text, userId, replyToken) {
 async function handleEvent(event) {
   const userId = event.source && event.source.userId;
   const replyToken = event.replyToken;
+  // ONE deadline for every LLM call this event makes, fixed here at receipt.
+  // The reply token started ageing before this line, so it is deliberately
+  // pessimistic; see the budget note at the top of src/gemini.js.
+  const deadline = newEventDeadline();
 
   try {
     if (!userId || !replyToken) return; // e.g. group event without a user id
@@ -241,10 +266,16 @@ async function handleEvent(event) {
 
     const command = text.match(COMMAND_RE);
     if (command) {
-      return await handleCommand(command[1].toLowerCase(), command[2], userId, replyToken);
+      return await handleCommand(
+        command[1].toLowerCase(),
+        command[2],
+        userId,
+        replyToken,
+        deadline
+      );
     }
 
-    return await handleFreeText(text, userId, replyToken);
+    return await handleFreeText(text, userId, replyToken, deadline);
   } catch (err) {
     console.error('[webhook] event handling error:', err && err.message);
     if (replyToken) {
