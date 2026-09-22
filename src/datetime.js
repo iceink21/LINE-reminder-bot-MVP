@@ -247,7 +247,7 @@ function withTimeOfDay(dateStr, timeOfDay) {
 }
 
 /**
- * Normalise whatever Gemini returned into a UTC ISO string.
+ * Normalise whatever the model returned into a UTC ISO string.
  * A timestamp without an offset is read as Thai local time, not UTC.
  */
 function toUtcIso(value) {

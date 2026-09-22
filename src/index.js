@@ -29,7 +29,7 @@ app.post(
   '/webhook',
   lineMiddleware({ channelSecret: config.line.channelSecret }),
   async (req, res) => {
-    // Ack immediately: LINE times out at 1s and retries, while a Gemini
+    // Ack immediately: LINE times out at 1s and retries, while an LLM
     // round-trip can take several seconds.
     res.status(200).end();
     const events = (req.body && req.body.events) || [];

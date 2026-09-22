@@ -41,16 +41,25 @@ const config = {
   // per calendar month. Replies via replyToken are unlimited and never counted.
   pushLimit: Number(process.env.PUSH_MONTHLY_LIMIT || 200),
   pushWarnRatio: Number(process.env.PUSH_WARN_RATIO || 0.9),
-  // Fallback provider, used whenever the primary parse fails for any reason.
-  gemini: {
-    apiKey: process.env.GEMINI_API_KEY || '',
-    model: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
-  },
-  // Primary provider.
+  // BOTH LLM legs now run through OpenRouter on ONE key: the primary parse uses
+  // `model`, and `fallbackModel` re-runs the same prompt whenever the primary
+  // fails for any reason. Previously the fallback was Google Gemini direct,
+  // which meant a second provider, a second key and a second response shape to
+  // keep in sync; consolidating removes all three.
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY || '',
     model: process.env.OPENROUTER_MODEL || 'inception/mercury-2.5',
-    // Whether to send `reasoning: { enabled: false }` with each request.
+    // Fallback leg. qwen3-30b-a3b-instruct-2507 is an INSTRUCT-only build with
+    // no reasoning in the weights — so it cannot burn the fallback budget
+    // thinking — and it supports JSON output via response_format. Do NOT send
+    // it `reasoning: { enabled: false }`; see `disableReasoning` below.
+    fallbackModel:
+      process.env.OPENROUTER_FALLBACK_MODEL || 'qwen/qwen3-30b-a3b-instruct-2507',
+    // Whether to send `reasoning: { enabled: false }` on the PRIMARY leg.
+    // It is never sent on the fallback leg: qwen3-30b-a3b-instruct-2507 has no
+    // reasoning to disable, and several OpenRouter endpoints answer the flag
+    // with HTTP 400 outright — so sending it there could only ever break a leg
+    // that is already the last resort.
     // OFF by default, because the flag is not universally accepted: several
     // endpoints (glm-5.3-flash among them) reject it outright with
     // HTTP 400 "Reasoning is mandatory for this endpoint and cannot be
@@ -110,9 +119,12 @@ function assertConfig() {
   if (missing.length) {
     throw new Error(`Missing required env vars: ${missing.join(', ')}`);
   }
+  // One key now covers BOTH legs, so this single warning is the whole story:
+  // without it there is no primary AND no fallback.
   if (!config.openrouter.apiKey || config.openrouter.apiKey.startsWith('REPLACE_ME')) {
     console.warn(
-      '[config] OPENROUTER_API_KEY is not set to a real key — natural-language parsing will fail until you fill it in.'
+      '[config] OPENROUTER_API_KEY is not set to a real key — natural-language parsing will fail until you fill it in. ' +
+        'Both the primary and the fallback leg run through OpenRouter, so neither can work without it.'
     );
   }
   // The EVENT budget — not the single-chain sum — is what has to fit inside the
@@ -148,11 +160,6 @@ function assertConfig() {
         'ms) exceeds the ' +
         config.llm.eventBudgetMs +
         'ms event budget, so it will be clipped by the event deadline.'
-    );
-  }
-  if (!config.gemini.apiKey || config.gemini.apiKey.startsWith('REPLACE_ME')) {
-    console.warn(
-      '[config] GEMINI_API_KEY is not set to a real key — the fallback is disabled; any OpenRouter failure will fail the parse.'
     );
   }
 }

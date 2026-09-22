@@ -1,6 +1,6 @@
 # LINE Reminder Bot
 
-บอทเตือนความจำส่วนตัวบน LINE Official Account — พิมพ์อะไรมาก็ได้เป็นภาษาไทยธรรมดา บอทใช้ inception/mercury-2.5 ผ่าน OpenRouter (มี Gemini เป็น fallback) คัด **ทันทีที่ข้อความเข้ามา** ว่าเป็นงาน + กำหนดส่งหรือเปล่า ถ้าใช่บันทึกลง SQLite เป็น `pending` เลย (ไม่ต้องกดยืนยัน) แล้วตอบรับทราบด้วย reply ที่ไม่กินโควตา ถ้าไม่ใช่ก็คุยตอบกลับตามปกติ — ส่วน **ตอนเที่ยงคืน** เป็นแค่รอบ **สรุปบทสนทนา** ของวันนั้นเป็น push เดียวต่อคน
+บอทเตือนความจำส่วนตัวบน LINE Official Account — พิมพ์อะไรมาก็ได้เป็นภาษาไทยธรรมดา บอทใช้ inception/mercury-2.5 ผ่าน OpenRouter (มี `qwen/qwen3-30b-a3b-instruct-2507` เป็น fallback ผ่าน OpenRouter เหมือนกัน) คัด **ทันทีที่ข้อความเข้ามา** ว่าเป็นงาน + กำหนดส่งหรือเปล่า ถ้าใช่บันทึกลง SQLite เป็น `pending` เลย (ไม่ต้องกดยืนยัน) แล้วตอบรับทราบด้วย reply ที่ไม่กินโควตา ถ้าไม่ใช่ก็คุยตอบกลับตามปกติ — ส่วน **ตอนเที่ยงคืน** เป็นแค่รอบ **สรุปบทสนทนา** ของวันนั้นเป็น push เดียวต่อคน
 
 ## ทำอะไรได้บ้าง
 
@@ -66,7 +66,7 @@
 | งบ | ขอบเขต | ค่าเริ่มต้น | env |
 |---|---|---|---|
 | ขาหลัก | `callOpenRouter()` หนึ่งขา | 25,000 ms | `LLM_PRIMARY_TIMEOUT_MS` |
-| ขา fallback | `callGemini()` **ทั้งขา** รวม retry และ sleep ทุกครั้ง | 20,000 ms | `LLM_FALLBACK_TIMEOUT_MS` |
+| ขา fallback | `callOpenRouter()` ด้วยโมเดล fallback **ทั้งขา** รวม retry และ sleep ทุกครั้ง | 20,000 ms | `LLM_FALLBACK_TIMEOUT_MS` |
 | **ทั้งอีเวนต์** | **งาน LLM ทั้งหมดของ webhook event เดียว** | **45,000 ms** | `LLM_EVENT_BUDGET_MS` |
 
 ภายใน **หนึ่งเชน** กรณีแย่สุดเป็นแบบลำดับ: ขาหลัก timeout → ขา fallback ทำงาน → ยิง reply API รวม 45s
@@ -81,7 +81,7 @@
 
 กฎอีกสองข้อที่บังคับในโค้ดด้วยเหตุผลเดียวกัน:
 
-1. **งบของขาหนึ่ง ๆ คลุมทั้งขา** ไม่ใช่ต่อ fetch — `AbortSignal.timeout()` เดิมถูกสร้าง *ข้างใน* ลูป retry ของ `callGemini()` ทำให้ขาที่เขียนว่า 20s วิ่งจริงได้ถึง ~76s (3 fetch × 20s + 2 sleep × 8s) ตอนนี้คำนวณ `legDeadline` ครั้งเดียวก่อนเข้าลูป แต่ละ attempt ได้เวลาที่เหลือ และถ้าเวลาที่เหลือไม่พอสำหรับ sleep + attempt ขั้นต่ำ ก็เลิก retry ทันที
+1. **งบของขาหนึ่ง ๆ คลุมทั้งขา** ไม่ใช่ต่อ fetch — `AbortSignal.timeout()` เดิมถูกสร้าง *ข้างใน* ลูป retry ของขา fallback ทำให้ขาที่เขียนว่า 20s วิ่งจริงได้ถึง ~76s (3 fetch × 20s + 2 sleep × 8s) ตอนนี้คำนวณ `legDeadline` ครั้งเดียวก่อนเข้าลูป แต่ละ attempt ได้เวลาที่เหลือ และถ้าเวลาที่เหลือไม่พอสำหรับ sleep + attempt ขั้นต่ำ ก็เลิก retry ทันที
 2. **ความล้มเหลวฝั่งผู้ให้บริการไม่เรียกเชนที่สอง** — `replyAsChat` จะทำงานเฉพาะตอนที่ผลพาร์สเป็นคำตัดสินเกี่ยวกับ *ข้อความของผู้ใช้* (`low_confidence`, `no_title`, `no_deadline`) ส่วน `network` (ซึ่งคือหน้าตาของ AbortSignal timeout), `http_402`, `http_503` ฯลฯ ตอบด้วย inbox ack ไปเลย — ยิง LLM ซ้ำตอนปลายทางล่มไม่ช่วยอะไร มีแต่ทำให้งบบานสองเท่า
 
 ทำไมไม่ย้ายไปส่งด้วย **push** แล้วตัดปัญหาอายุโทเคนทิ้ง: reply ฟรีและไม่จำกัด แต่ push จำกัด **200 ข้อความ/เดือน** (~6/วัน) การจ่ายโควตา push เพื่อซื้อเวลาที่หน้าต่าง reply 60 วินาทียังให้ฟรีอยู่แล้ว เป็นการถอยหลัง
@@ -116,7 +116,8 @@ curl http://localhost:3000/usage   # {"month":"2026-08","count":12,"limit":200}
 src/
   index.js      Express app, /webhook (มี LINE signature middleware) + /health + /usage, บูต scheduler
   webhook.js    routing ของ event: command / free text (พาร์สเป็นงานสดทันที + เก็บลง inbox) / follow
-  gemini.js     เรียก OpenRouter (หลัก, ค่าเริ่มต้น mercury-2.5) / Gemini (fallback) — parseReminder + summarizeDay + chatReply
+  gemini.js     เรียก OpenRouter ทั้งสองขา (หลัก mercury-2.5 / fallback qwen3-30b-a3b-instruct) — parseReminder + summarizeDay + chatReply
+                (ชื่อไฟล์เป็นมรดกจากตอนที่ fallback ยังเป็น Gemini — ตอนนี้ไม่มี Gemini แล้ว การเปลี่ยนชื่อเป็นงานแยก)
   db.js         better-sqlite3: schema + prepared statement (scope ด้วย line_user_id ทุกคำสั่ง)
   scheduler.js  node-cron: sweep ทุกนาที + สรุปบทสนทนาเที่ยงคืน 00:00 + สรุปงานค้างประจำวัน 06:00
   messages.js   ข้อความภาษาไทยทั้งหมด
@@ -172,7 +173,9 @@ test/
 
 > ⚠️ **บัญชี OpenRouter ยังไม่ได้เติมเงิน** (`is_free_tier: true`, ใช้สะสม $0.0066) โมเดลเสียเงินส่วนใหญ่จึงตอบ HTTP 402 ตอนนี้ mercury-2.5 ยังวิ่งได้ด้วยยอดคงเหลือก้อนเล็ก ๆ — **ต้องเติมเครดิตเองเพื่อให้ใช้ได้ต่อ** เป็นงานมือของผู้ใช้ ไม่ใช่เรื่องที่แก้ด้วยโค้ด
 
-**ฝั่ง fallback (`gemini-3.6-flash`) ก็ไม่น่าไว้ใจ** — วัดสด 5 ครั้งได้ HTTP 503 `"model is overloaded"` **3 ใน 5** แก้จากฝั่งเราไม่ได้ ดังนั้น "ตกมาถึง fallback" ไม่เท่ากับ "ได้คำตอบ" ดู `KNOWN_ISSUES.md` (M-2)
+**ฝั่ง fallback ย้ายมาอยู่บน OpenRouter แล้ว (2026-09-22)** — เดิมเป็น `gemini-3.6-flash` ยิงตรงไป Google ซึ่งทั้งล่มเอง (HTTP 503 `"model is overloaded"` 3 ใน 5 ครั้ง) และติดโควตาฟรี 20 req/วัน ตอนนี้ใช้ `qwen/qwen3-30b-a3b-instruct-2507` ผ่าน OpenRouter คีย์เดียวกับตัวหลัก เป็นรุ่น **instruct ล้วน ไม่มี reasoning ในตัว** จึงไม่กินงบเวลาไปกับการคิด และรองรับ JSON output
+
+> ⚠️ **สิ่งที่เสียไปจากการย้าย:** ขา Gemini เคยส่ง `responseSchema` ไปด้วย ซึ่งบังคับรูปร่าง JSON ถึงระดับคีย์ ฝั่ง OpenAI-compatible มีแค่ `response_format: {type:'json_object'}` ที่การันตีแค่ว่า "เป็น JSON ที่ parse ได้" ไม่ได้การันตีคีย์ ⇒ ตอนนี้ **ทั้งสองขา** พึ่ง `SYSTEM_RULES` ในพรอมป์ + `extractJson()` + `finalizeResult()` เป็นตาข่ายรับอย่างเดียว (รูปร่างที่ผิดยังถูกปัดตกเป็น `bad_json` / `no_title` / `no_deadline` ตามเดิม ไม่มีอะไรหลุดเงียบ ๆ)
 
 **ฟิลด์ `reasoning` ส่งตายตัวไม่ได้** หลายผู้ให้บริการตอบกลับเป็น HTTP 400 `"Reasoning is mandatory for this endpoint and cannot be disabled"` จึงเป็นสวิตช์ `OPENROUTER_DISABLE_REASONING` ที่ **ปิดไว้เป็นค่าเริ่มต้น** — mercury-2.5 คิดเป็นค่าเริ่มต้นและ **ปล่อยไว้แบบนั้นถูกแล้ว** เพราะ reasoning ของมันมีขอบเขตและนิ่ง เปลี่ยนโมเดลทีหลังจึงเป็นการแก้ config ไม่ใช่แก้โค้ด
 
@@ -187,8 +190,7 @@ test/
 | `PORT` | — | `3000` |
 | `OPENROUTER_MODEL` | — | `inception/mercury-2.5` |
 | `OPENROUTER_DISABLE_REASONING` | — | `false` (ไม่ตั้ง = ไม่ส่งฟิลด์ `reasoning` เลย) ตั้งเป็น `true` ก็ต่อเมื่อเปลี่ยนไปใช้โมเดลที่คิดยาวจนเกินงบขาหลัก **และ** รับฟิลด์นี้ได้ — glm-5.3-flash ตอบ HTTP 400 ถ้าส่งไป ส่วน mercury-2.5 คิดเป็นปกติแต่มีขอบเขต ปล่อยปิดสวิตช์ไว้ |
-| `GEMINI_API_KEY` | — | จาก Google AI Studio; ใช้เป็น fallback ทุกครั้งที่ตัวหลักพลาด (429/4xx/5xx/เน็ตหลุด/JSON เสีย); ไม่ใส่ = ปิด fallback |
-| `GEMINI_MODEL` | — | `gemini-3.6-flash` (ขา fallback; ตอบ HTTP 503 บ่อย ดู M-2) |
+| `OPENROUTER_FALLBACK_MODEL` | — | `qwen/qwen3-30b-a3b-instruct-2507` (ขา fallback) ใช้ทุกครั้งที่ตัวหลักพลาด (429/4xx/5xx/เน็ตหลุด/JSON เสีย) — คีย์เดียวกับตัวหลัก ไม่มีคีย์แยกอีกแล้ว |
 | `LLM_PRIMARY_TIMEOUT_MS` | — | `25000` งบของขาหลัก (หนึ่ง fetch) |
 | `LLM_FALLBACK_TIMEOUT_MS` | — | `20000` งบของขา fallback **ทั้งขา** รวม retry และ sleep ทุกครั้ง ไม่ใช่ต่อ attempt |
 | `LLM_EVENT_BUDGET_MS` | — | `45000` เพดานงาน LLM **ทั้งหมดของหนึ่ง webhook event** (หนึ่งอีเวนต์รันได้สองเชน) — **เลขนี้บวกเวลายิง reply ต้องน้อยกว่า 60s** ซึ่งเป็นอายุ reply token; เป็นสมการที่ `assertConfig()` ตรวจ |
@@ -246,7 +248,6 @@ ngrok http 3000
    LINE_CHANNEL_ACCESS_TOKEN=...
    LINE_CHANNEL_SECRET=...
    OPENROUTER_API_KEY=...
-   GEMINI_API_KEY=...
    DATABASE_URL=file:/data/dev.db
    TZ_NAME=Asia/Bangkok
    ```
@@ -271,7 +272,7 @@ ngrok http 3000
 
 - ลายเซ็น webhook ตรวจด้วย middleware ของ `@line/bot-sdk` (ไม่ได้เขียน HMAC เอง) — ลายเซ็นผิด/ไม่มี ตอบ `401`
 - ทุก query ที่แตะข้อมูลผู้ใช้ scope ด้วย `line_user_id` ทั้ง read และ write → `/done` `/edit` `/delete` ข้ามคนอื่นไม่ได้
-- GEMINI API key ส่งผ่าน header `x-goog-api-key` ไม่ใช่ query string เพื่อไม่ให้ติดไปกับ access log
-- ไม่มีการ log ค่า secret หรือ body ของ error จากฝั่ง Gemini
+- OpenRouter API key ส่งผ่าน header `Authorization: Bearer` ไม่ใช่ query string เพื่อไม่ให้ติดไปกับ access log
+- ไม่มีการ log ค่า secret หรือ body ของ error จากฝั่งผู้ให้บริการ LLM (log แค่ HTTP status กับชื่อโมเดล)
 - `inbox_messages` ก็ scope ด้วย `line_user_id` เหมือนกัน — รอบสรุปเที่ยงคืนอ่าน/ประทับเฉพาะแถวของผู้ใช้คนนั้น
 - `/usage` เปิดอ่านได้โดยไม่ต้อง auth เหมือน `/health` — คืนแค่ตัวเลข `{month, count, limit}` ไม่มี user id หรือเนื้อหาข้อความ

@@ -2,7 +2,7 @@
   "name": "line-reminder-bot",
   "version": "1.0.0",
   "private": true,
-  "description": "Personal LINE OA reminder bot — Thai natural-language task capture via Gemini, SQLite storage, cron push reminders.",
+  "description": "Personal LINE OA reminder bot — Thai natural-language task capture via OpenRouter (mercury-2.5 primary, qwen3-30b-a3b-instruct fallback), SQLite storage, cron push reminders.",
   "type": "commonjs",
   "main": "src/index.js",
   "engines": {

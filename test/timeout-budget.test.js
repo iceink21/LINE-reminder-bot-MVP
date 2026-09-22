@@ -20,7 +20,13 @@ process.env.LLM_PRIMARY_TIMEOUT_MS = '2000';
 process.env.LLM_FALLBACK_TIMEOUT_MS = '4000';
 process.env.LLM_EVENT_BUDGET_MS = '8000';
 process.env.OPENROUTER_API_KEY = 'sk-test-not-a-real-key';
-process.env.GEMINI_API_KEY = 'test-not-a-real-key';
+// Both legs are OpenRouter now and therefore hit the SAME url, so the model id
+// is the only thing that tells them apart. Pin both to fixed test values so the
+// fake fetch can dispatch on them regardless of what .env happens to contain.
+const PRIMARY_MODEL = 'test/primary-model';
+const FALLBACK_MODEL = 'test/fallback-model';
+process.env.OPENROUTER_MODEL = PRIMARY_MODEL;
+process.env.OPENROUTER_FALLBACK_MODEL = FALLBACK_MODEL;
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -43,7 +49,7 @@ function stubModule(relative, exports) {
   return filename;
 }
 
-/** Minimal fetch Response stand-in — only what callGemini/callOpenRouter read. */
+/** Minimal fetch Response stand-in — only what callOpenRouter reads. */
 function fakeResponse({ status = 200, body = {}, headers = {} } = {}) {
   const lower = {};
   for (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = String(v);
@@ -56,9 +62,22 @@ function fakeResponse({ status = 200, body = {}, headers = {} } = {}) {
   };
 }
 
-const geminiJsonBody = (obj) => ({
-  candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }],
+/** OpenAI-shaped response body — the only shape either leg returns now. */
+const chatJsonBody = (obj) => ({
+  choices: [{ message: { content: JSON.stringify(obj) } }],
 });
+
+/** The parsed request body of a fake fetch call. */
+function requestBody(init) {
+  try {
+    return JSON.parse(init && init.body);
+  } catch (_) {
+    return {};
+  }
+}
+
+/** Which leg this call belongs to. Both legs share a url; the model tells them apart. */
+const isPrimaryCall = (init) => requestBody(init).model === PRIMARY_MODEL;
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -181,10 +200,10 @@ test('B1-secondary: the fallback leg respects its budget across retries', async 
   const budget = config.llm.fallbackTimeoutMs; // 4000 in this file
   const originalFetch = globalThis.fetch;
 
-  let geminiCalls = 0;
-  globalThis.fetch = async (url) => {
-    if (String(url).includes('openrouter')) return fakeResponse({ status: 500 });
-    geminiCalls += 1;
+  let fallbackCalls = 0;
+  globalThis.fetch = async (_url, init) => {
+    if (isPrimaryCall(init)) return fakeResponse({ status: 500 });
+    fallbackCalls += 1;
     // Always 429, always asking for a 1s wait — the retry path, on repeat.
     return fakeResponse({ status: 429, headers: { 'retry-after': '1' } });
   };
@@ -202,7 +221,7 @@ test('B1-secondary: the fallback leg respects its budget across retries', async 
 
   assert.ok(thrown instanceof ParseError, 'the leg still fails, it just fails in budget');
   assert.strictEqual(thrown.code, 'http_429');
-  assert.ok(geminiCalls > 1, 'retries still happen while there is budget for them');
+  assert.ok(fallbackCalls > 1, 'retries still happen while there is budget for them');
   assert.ok(
     elapsed <= budget + 1500,
     'the whole fallback leg (fetches + backoff sleeps) must fit its ' +
@@ -217,10 +236,10 @@ test('B1-secondary: a retry is abandoned when the remaining budget cannot cover 
   const { parseReminder } = require('../src/gemini');
   const originalFetch = globalThis.fetch;
 
-  let geminiCalls = 0;
-  globalThis.fetch = async (url) => {
-    if (String(url).includes('openrouter')) return fakeResponse({ status: 500 });
-    geminiCalls += 1;
+  let fallbackCalls = 0;
+  globalThis.fetch = async (_url, init) => {
+    if (isPrimaryCall(init)) return fakeResponse({ status: 500 });
+    fallbackCalls += 1;
     // Daily-quota style Retry-After: an hour. Clamped to MAX_RETRY_DELAY_MS
     // (8s), which is still more than this file's 4s leg budget, so the retry
     // must be abandoned outright rather than slept through.
@@ -232,7 +251,7 @@ test('B1-secondary: a retry is abandoned when the remaining budget cannot cover 
   const elapsed = Date.now() - started;
   globalThis.fetch = originalFetch;
 
-  assert.strictEqual(geminiCalls, 1, 'no second attempt when the budget cannot cover the wait');
+  assert.strictEqual(fallbackCalls, 1, 'no second attempt when the budget cannot cover the wait');
   assert.ok(elapsed < 2000, 'it must give up immediately, not sleep first; took ' + elapsed + 'ms');
 });
 
@@ -240,14 +259,14 @@ test('B1-secondary: the fallback still retries and succeeds when the budget allo
   const { parseReminder } = require('../src/gemini');
   const originalFetch = globalThis.fetch;
 
-  let geminiCalls = 0;
-  globalThis.fetch = async (url) => {
-    if (String(url).includes('openrouter')) return fakeResponse({ status: 500 });
-    geminiCalls += 1;
-    if (geminiCalls === 1) return fakeResponse({ status: 429, headers: { 'retry-after': '1' } });
+  let fallbackCalls = 0;
+  globalThis.fetch = async (_url, init) => {
+    if (isPrimaryCall(init)) return fakeResponse({ status: 500 });
+    fallbackCalls += 1;
+    if (fallbackCalls === 1) return fakeResponse({ status: 429, headers: { 'retry-after': '1' } });
     return fakeResponse({
       status: 200,
-      body: geminiJsonBody({
+      body: chatJsonBody({
         title: 'ส่งรายงาน',
         deadline_iso: '2026-09-22T15:00:00+07:00',
         recurring: false,
@@ -259,7 +278,7 @@ test('B1-secondary: the fallback still retries and succeeds when the budget allo
   const result = await parseReminder('ส่งรายงานพรุ่งนี้บ่าย 2', new Date());
   globalThis.fetch = originalFetch;
 
-  assert.strictEqual(geminiCalls, 2, 'the 429 retry must still happen — the fix bounds it, not removes it');
+  assert.strictEqual(fallbackCalls, 2, 'the 429 retry must still happen — the fix bounds it, not removes it');
   assert.strictEqual(result.title, 'ส่งรายงาน');
 });
 
@@ -275,7 +294,7 @@ test('event deadline: an already-spent budget refuses to start any leg', async (
   let fetches = 0;
   globalThis.fetch = async () => {
     fetches += 1;
-    return fakeResponse({ status: 200, body: geminiJsonBody({}) });
+    return fakeResponse({ status: 200, body: chatJsonBody({}) });
   };
 
   const spent = Date.now() - 1000; // a deadline that passed a second ago
@@ -299,15 +318,15 @@ test('event deadline: the fallback leg is skipped when only the primary fits', a
   const { parseReminder, ParseError } = require('../src/gemini');
   const originalFetch = globalThis.fetch;
 
-  let geminiCalls = 0;
-  globalThis.fetch = async (url) => {
-    if (String(url).includes('openrouter')) {
+  let fallbackCalls = 0;
+  globalThis.fetch = async (_url, init) => {
+    if (isPrimaryCall(init)) {
       // Spend most of the event budget in the primary leg before failing.
       await delay(400);
       return fakeResponse({ status: 500 });
     }
-    geminiCalls += 1;
-    return fakeResponse({ status: 200, body: geminiJsonBody({}) });
+    fallbackCalls += 1;
+    return fakeResponse({ status: 200, body: chatJsonBody({}) });
   };
 
   // Enough budget to start the primary (needs >= MIN_ATTEMPT_MS) but not
@@ -322,7 +341,100 @@ test('event deadline: the fallback leg is skipped when only the primary fits', a
 
   assert.ok(err instanceof ParseError);
   assert.strictEqual(err.code, 'deadline_exceeded');
-  assert.strictEqual(geminiCalls, 0, 'the fallback must not start outside the event budget');
+  assert.strictEqual(fallbackCalls, 0, 'the fallback must not start outside the event budget');
+});
+
+// -----------------------------------------------------------------------------
+// Consolidation onto one OpenRouter client (2026-09-22). One function now serves
+// both legs, so the two things that MUST stay different per leg are pinned here:
+// the retry policy, and the reasoning flag.
+// -----------------------------------------------------------------------------
+test('consolidation: the primary does not retry a 429 — it falls straight through', async () => {
+  const { parseReminder } = require('../src/gemini');
+  const originalFetch = globalThis.fetch;
+
+  const models = [];
+  globalThis.fetch = async (url, init) => {
+    assert.match(String(url), /openrouter/, 'both legs must go to OpenRouter');
+    const body = requestBody(init);
+    models.push(body.model);
+    if (body.model === PRIMARY_MODEL) {
+      // A 429 the primary is NOT allowed to sleep on: retrying here would only
+      // delay the leg that actually has a chance of answering.
+      return fakeResponse({ status: 429, headers: { 'retry-after': '1' } });
+    }
+    return fakeResponse({
+      status: 200,
+      body: chatJsonBody({
+        title: 'ส่งรายงาน',
+        deadline_iso: '2026-09-23T15:00:00+07:00',
+        recurring: false,
+        confident: true,
+      }),
+    });
+  };
+
+  const started = Date.now();
+  const result = await parseReminder('ส่งรายงานพรุ่งนี้บ่าย 2', new Date());
+  const elapsed = Date.now() - started;
+  globalThis.fetch = originalFetch;
+
+  assert.deepStrictEqual(
+    models,
+    [PRIMARY_MODEL, FALLBACK_MODEL],
+    'exactly one primary attempt, then the fallback model'
+  );
+  assert.ok(elapsed < 900, 'no backoff sleep on the primary leg; took ' + elapsed + 'ms');
+  assert.strictEqual(result.title, 'ส่งรายงาน');
+});
+
+test('consolidation: the fallback leg never sends the reasoning flag', async () => {
+  // Turn the flag ON for the primary, the only configuration in which it is
+  // sent at all — the fallback model answers it with HTTP 400, so it must stay
+  // off there even then.
+  process.env.OPENROUTER_DISABLE_REASONING = 'true';
+  delete require.cache[require.resolve('../src/config')];
+  delete require.cache[require.resolve('../src/gemini')];
+  const { parseReminder } = require('../src/gemini');
+  const originalFetch = globalThis.fetch;
+
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => {
+    const body = requestBody(init);
+    bodies.push(body);
+    if (body.model === PRIMARY_MODEL) return fakeResponse({ status: 500 });
+    return fakeResponse({
+      status: 200,
+      body: chatJsonBody({
+        title: 'ส่งรายงาน',
+        deadline_iso: '2026-09-23T15:00:00+07:00',
+        recurring: false,
+        confident: true,
+      }),
+    });
+  };
+
+  try {
+    await parseReminder('ส่งรายงานพรุ่งนี้บ่าย 2', new Date());
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.OPENROUTER_DISABLE_REASONING;
+    delete require.cache[require.resolve('../src/config')];
+    delete require.cache[require.resolve('../src/gemini')];
+  }
+
+  const [primary, fallback] = bodies;
+  assert.deepStrictEqual(primary.reasoning, { enabled: false }, 'the flag reaches the primary');
+  assert.strictEqual(
+    'reasoning' in fallback,
+    false,
+    'the fallback must carry NO reasoning field — several endpoints answer it with HTTP 400'
+  );
+  assert.deepStrictEqual(
+    fallback.response_format,
+    { type: 'json_object' },
+    'JSON-ness on the fallback now rests on response_format, not a provider schema'
+  );
 });
 
 // -----------------------------------------------------------------------------

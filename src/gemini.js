@@ -10,12 +10,17 @@ const {
   withTimeOfDay,
 } = require('./datetime');
 
-// Fallback provider — see parseReminder().
-const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
-// Primary provider: OpenAI-compatible chat/completions (inception/mercury-2.5,
-// paid but cheap — ~$0.00046 per parse — via OpenRouter). Measured 9/9 reps at
-// 4.9-8.5s against the real 2,982-char Thai prompt, with bounded, stable
-// reasoning (2035-2460 tokens, no spikes).
+// BOTH legs are OpenAI-compatible chat/completions calls to OpenRouter, on one
+// key and through one client (callOpenRouter), differing only in the model id
+// and the retry policy passed in:
+//   - primary  = inception/mercury-2.5 (paid but cheap, ~$0.00046 per parse).
+//     Measured 9/9 reps at 4.9-8.5s against the real 2,982-char Thai prompt,
+//     with bounded, stable reasoning (2035-2460 tokens, no spikes). NO retries.
+//   - fallback = qwen/qwen3-30b-a3b-instruct-2507, an instruct-only build with
+//     no reasoning in the weights. Retries 429s (see MAX_429_RETRIES).
+// The fallback used to be Google Gemini direct — a second provider, a second
+// key, and a second response shape. That is gone; there was never an SDK, only
+// a URL constant and a second call function.
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 // ---------------------------------------------------------------------------
 // TIMEOUT BUDGETS — THREE numbers, and they are coupled. Read this before
@@ -59,18 +64,25 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 //
 // Two further rules follow from the same reasoning and are enforced in code:
 //   - a leg's budget covers the WHOLE leg, retries and backoff sleeps
-//     included, not each individual fetch (see callGemini's legDeadline);
+//     included, not each individual fetch (see callOpenRouter's legDeadline);
 //   - webhook.js only starts a second chain for a verdict about the USER'S
 //     TEXT ('low_confidence' and friends), never after a provider failure —
 //     a second LLM call cannot help when the provider is down, and it is what
 //     doubled the budget in the first place.
 //
-// Why the split, given the primary is fast: the fallback leg is the slow one.
-// gemini-3.6-flash is a thinking model whose thinking cannot be switched off
-// and measures 11.5-22.6s on its own, so 12s was below its floor — a fallback
-// that was invoked was very likely to be killed before it could answer. It is
-// also independently flaky (HTTP 503 "model is overloaded" on 3 of 5 live
-// calls on 2026-09-21), so it needs every second it can get.
+// Why the fallback still gets its own, separate 20s rather than sharing the
+// primary's number: it is the only leg that RETRIES, and its budget has to
+// cover every attempt plus the backoff sleeps between them (the primary makes
+// exactly one fetch, so for it leg budget and fetch budget coincide). The old
+// justification for this figure — gemini-3.6-flash's undisableable 11.5-22.6s
+// thinking latency — no longer applies now that the fallback is
+// qwen3-30b-a3b-instruct-2507, which does not reason at all and should answer
+// well inside a single attempt. The 20s is therefore RETRY headroom, not
+// think-time headroom: up to 3 attempts plus 2 clamped backoff sleeps have to
+// fit inside it, and it is kept at 20s rather than trimmed because shrinking it
+// would buy nothing (the event budget, not this number, is the real bound) and
+// would cost the retries their room. If the fallback is ever pointed at a
+// thinking model again, re-check this number against that model's floor.
 //
 // All three overridable via LLM_PRIMARY_TIMEOUT_MS / LLM_FALLBACK_TIMEOUT_MS /
 // LLM_EVENT_BUDGET_MS.
@@ -82,9 +94,12 @@ const EVENT_BUDGET_MS = config.llm.eventBudgetMs;
 // then eats the remaining budget. Used to abandon rather than start a doomed
 // attempt.
 const MIN_ATTEMPT_MS = 1000;
-// Free-tier RPM caps on gemini-3.6-flash produce transient 429s under normal
-// traffic — retry a couple times with backoff before giving up, honoring
-// Retry-After when Gemini sends it.
+// OpenRouter rate-limits per key, so a burst of traffic (or a shared upstream
+// pool) produces transient 429s — retry a couple of times with backoff before
+// giving up, honoring Retry-After when the response carries it. This applies to
+// the FALLBACK leg only: the primary is given `retries: 0` deliberately, since
+// it already has a fallback behind it and spending the primary's budget on a
+// retry would just delay reaching it.
 const MAX_429_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 1500;
 // Daily-quota 429s can carry a Retry-After measured in hours, not seconds —
@@ -93,7 +108,7 @@ const RETRY_BASE_DELAY_MS = 1500;
 // AbortSignal used to be unbounded as a group, so with MAX_429_RETRIES = 2 a
 // leg documented as 20s could really run 3 x 20s of fetch plus 2 x 8s of sleep
 // = ~76s. Both the sleeps and the fetches now sit under one per-leg deadline
-// (see callGemini), which is what actually enforces the 20s.
+// (see callOpenRouter), which is what actually enforces the 20s.
 const MAX_RETRY_DELAY_MS = 8000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -220,26 +235,21 @@ const SYSTEM_RULES = [
   '- confident: false ถ้าข้อความไม่ใช่การสั่งงาน หรือเป็นงานครั้งเดียวที่ไม่มีกำหนดเวลาที่พอจะเดาได้',
 ].join('\n');
 
-const RESPONSE_SCHEMA = {
-  type: 'OBJECT',
-  properties: {
-    title: { type: 'STRING' },
-    // Nullable and no longer required: a standing ("ทุกวัน") reminder has no
-    // deadline at all. finalizeResult still rejects a missing deadline on the
-    // non-recurring path, so the default behaviour is unchanged.
-    deadline_iso: { type: 'STRING', nullable: true },
-    // Symbolic weekday slot. The model names the day, finalizeResult resolves
-    // the actual date via resolveWeekday() — nullable and NOT required, so a
-    // message with no weekday reference is unaffected.
-    relative_weekday: { type: 'STRING', nullable: true },
-    weekday_qualifier: { type: 'STRING', nullable: true },
-    time_of_day: { type: 'STRING', nullable: true },
-    category: { type: 'STRING', nullable: true },
-    recurring: { type: 'BOOLEAN' },
-    confident: { type: 'BOOLEAN' },
-  },
-  required: ['title', 'recurring', 'confident'],
-};
+// NOTE — ACCEPTED LOSS OF STRICTNESS (2026-09-22).
+// There used to be a RESPONSE_SCHEMA here: a Google-shaped `responseSchema`
+// (title/deadline_iso/relative_weekday/weekday_qualifier/time_of_day/category/
+// recurring/confident, with only title+recurring+confident required) sent with
+// every Gemini fallback call, which made the fallback the STRICTER of the two
+// legs — it was schema-enforced while the primary was only instruction-guided.
+// OpenAI-compatible `response_format: { type: 'json_object' }` has no equivalent
+// in that shape: it guarantees syntactically valid JSON, not these keys. Now
+// that both legs are OpenRouter, the schema has no endpoint to be sent to and
+// the shape of the object is enforced NOWHERE at the wire level — SYSTEM_RULES
+// states it in the prompt, and extractJson() + finalizeResult() are the only
+// net, on BOTH legs. finalizeResult already rejects every bad shape it can see
+// (missing title -> 'no_title', missing/unparseable deadline -> 'no_deadline',
+// non-JSON -> 'bad_json'), so nothing silently passes; what is lost is the
+// provider refusing to emit a bad object in the first place.
 
 const DAY_RULES = [
   'คุณคือผู้ช่วยที่สรุปบทสนทนาภาษาไทยของผู้ใช้ในหนึ่งวัน',
@@ -388,9 +398,18 @@ function finalizeResult(rawText, provider, now = new Date(), userText = '') {
 }
 
 /**
- * Call Gemini and return the raw response text.
- * Now the fallback leg: reached only after OpenRouter has already failed, so any
- * ParseError thrown here is terminal and surfaces to the user.
+ * Call OpenRouter (OpenAI-compatible chat/completions) and return the raw
+ * response text. ONE client serves BOTH legs — the caller says which by passing
+ * `model`, and the two legs differ ONLY in the explicit arguments below:
+ *
+ *   primary : model = config.openrouter.model,         retries = 0
+ *   fallback: model = config.openrouter.fallbackModel, retries = MAX_429_RETRIES
+ *
+ * The retry policy is a parameter rather than a constant on purpose. The
+ * primary deliberately has NO retry loop: it has a whole fallback leg behind
+ * it, so burning its budget on a backoff sleep only delays reaching a model
+ * that might actually answer. The fallback is the last resort and has nothing
+ * behind it, so it retries transient 429s.
  *
  * `timeoutMs` bounds the WHOLE leg — every retry attempt and every backoff
  * sleep between them — not each individual fetch. A single absolute
@@ -398,93 +417,25 @@ function finalizeResult(rawText, provider, now = new Date(), userText = '') {
  * the time still left, and a retry is abandoned outright when what remains
  * cannot cover the sleep plus a minimum attempt. Putting AbortSignal.timeout()
  * inside the loop instead is the bug this replaces: it made the ceiling
- * per-attempt, so a "20s" leg could really run ~76s.
+ * per-attempt, so a "20s" leg could really run ~76s. With `retries: 0` the loop
+ * runs exactly once and the leg deadline and the fetch deadline coincide, which
+ * is precisely the primary's old single-fetch behaviour.
+ *
+ * `disableReasoning` is per-call and defaults to OFF (see below); only the
+ * primary ever passes the configured flag.
  */
-async function callGemini(prompt, { json = true, timeoutMs = FALLBACK_TIMEOUT_MS } = {}) {
-  const url = API_BASE + encodeURIComponent(config.gemini.model) + ':generateContent';
+async function callOpenRouter(
+  prompt,
+  {
+    json = true,
+    timeoutMs = PRIMARY_TIMEOUT_MS,
+    model = config.openrouter.model,
+    retries = 0,
+    disableReasoning = false,
+  } = {}
+) {
   const body = {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: json
-      ? {
-          temperature: 0,
-          responseMimeType: 'application/json',
-          responseSchema: RESPONSE_SCHEMA,
-        }
-      : { temperature: 0.3 },
-  };
-
-  // One deadline for the whole leg, fixed before the first attempt.
-  const legDeadline = Date.now() + timeoutMs;
-
-  let res;
-  for (let attempt = 0; ; attempt++) {
-    const attemptBudget = legDeadline - Date.now();
-    if (attemptBudget < MIN_ATTEMPT_MS) {
-      throw new ParseError('Gemini leg ran out of budget', 'timeout');
-    }
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // Key travels in a header so it never lands in a URL or access log.
-          'x-goog-api-key': config.gemini.apiKey,
-        },
-        body: JSON.stringify(body),
-        // Whatever is left of the leg, never a fresh full budget per attempt.
-        signal: AbortSignal.timeout(attemptBudget),
-      });
-    } catch (err) {
-      throw new ParseError('Gemini request failed: ' + err.name, 'network');
-    }
-
-    if (res.status !== 429 || attempt >= MAX_429_RETRIES) break;
-
-    const retryAfterHeader = Number(res.headers.get('retry-after'));
-    const rawDelay = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
-      ? retryAfterHeader * 1000
-      : RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-    const delay = Math.min(rawDelay, MAX_RETRY_DELAY_MS);
-    // Sleeping and then aborting the retry immediately would burn the rest of
-    // the budget for nothing, so give up the retry here and let the 429 stand
-    // as the leg's answer.
-    if (legDeadline - Date.now() < delay + MIN_ATTEMPT_MS) {
-      console.warn(
-        '[gemini] 429, but only ' + Math.max(0, legDeadline - Date.now()) +
-          'ms of the leg budget is left (needs ' + (delay + MIN_ATTEMPT_MS) +
-          'ms to retry) — giving up'
-      );
-      break;
-    }
-    console.warn('[gemini] 429, retrying in ' + delay + 'ms (attempt ' + (attempt + 1) + ')');
-    await res.body?.cancel();
-    await sleep(delay);
-  }
-
-  if (!res.ok) {
-    // Status only — the error body can echo request material.
-    throw new ParseError('Gemini returned HTTP ' + res.status, 'http_' + res.status);
-  }
-
-  const payload = await res.json().catch(() => null);
-  return payload &&
-    payload.candidates &&
-    payload.candidates[0] &&
-    payload.candidates[0].content &&
-    payload.candidates[0].content.parts &&
-    payload.candidates[0].content.parts.map((p) => p.text || '').join('');
-}
-
-/**
- * Call OpenRouter (OpenAI-compatible) and return the raw response text.
- * This is the primary leg. The OpenRouter models used here have no
- * structured-output schema, so JSON-ness rests on the same SYSTEM_RULES
- * instructions plus response_format, with extractJson() as a net — and,
- * failing that, the Gemini fallback.
- */
-async function callOpenRouter(prompt, { json = true, timeoutMs = PRIMARY_TIMEOUT_MS } = {}) {
-  const body = {
-    model: config.openrouter.model,
+    model,
     messages: [{ role: 'user', content: prompt }],
     temperature: json ? 0 : 0.3,
   };
@@ -522,28 +473,69 @@ async function callOpenRouter(prompt, { json = true, timeoutMs = PRIMARY_TIMEOUT
   //   - The free tier is closed, and widening the budget does not reopen it:
   //     re-measured at a 30s ceiling, nemotron-3.5-lightning:free timed out
   //     5/5 and glm-5.2:free returned HTTP 429 5/5 in under a second.
-  if (config.openrouter.disableReasoning) body.reasoning = { enabled: false };
+  //   - the FALLBACK model, qwen/qwen3-30b-a3b-instruct-2507, must never be
+  //     sent this flag at all: it is an instruct-only build with no reasoning
+  //     in the weights, so there is nothing to disable, and several OpenRouter
+  //     endpoints reject the flag with HTTP 400 — which would fail the one leg
+  //     that exists to catch a failure. runWithFallback passes false for it.
+  if (disableReasoning) body.reasoning = { enabled: false };
+  // Both legs rely on this plus SYSTEM_RULES for JSON-ness; neither has a
+  // structured-output schema any more. See the RESPONSE_SCHEMA note above.
   if (json) body.response_format = { type: 'json_object' };
 
+  // One deadline for the whole leg, fixed before the first attempt.
+  const legDeadline = Date.now() + timeoutMs;
+
   let res;
-  try {
-    res = await fetch(OPENROUTER_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + config.openrouter.apiKey,
-        // Optional OpenRouter analytics headers.
-        'HTTP-Referer': 'https://github.com/line-reminder-bot',
-        'X-Title': 'line-reminder-bot',
-      },
-      body: JSON.stringify(body),
-      // Primary leg — see the budget note at the top of this file. One fetch,
-      // no retry loop, so the leg budget and the fetch budget coincide here;
-      // the caller has already clipped it against the event deadline.
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (err) {
-    throw new ParseError('OpenRouter request failed: ' + err.name, 'network');
+  for (let attempt = 0; ; attempt++) {
+    const attemptBudget = legDeadline - Date.now();
+    if (attemptBudget < MIN_ATTEMPT_MS) {
+      throw new ParseError('OpenRouter leg ran out of budget (' + model + ')', 'timeout');
+    }
+    try {
+      res = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // Key travels in a header so it never lands in a URL or access log.
+          Authorization: 'Bearer ' + config.openrouter.apiKey,
+          // Optional OpenRouter analytics headers.
+          'HTTP-Referer': 'https://github.com/line-reminder-bot',
+          'X-Title': 'line-reminder-bot',
+        },
+        body: JSON.stringify(body),
+        // Whatever is left of the leg, never a fresh full budget per attempt.
+        // The caller has already clipped `timeoutMs` against the event deadline.
+        signal: AbortSignal.timeout(attemptBudget),
+      });
+    } catch (err) {
+      throw new ParseError('OpenRouter request failed: ' + err.name, 'network');
+    }
+
+    if (res.status !== 429 || attempt >= retries) break;
+
+    const retryAfterHeader = Number(res.headers.get('retry-after'));
+    const rawDelay = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+      ? retryAfterHeader * 1000
+      : RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+    const delay = Math.min(rawDelay, MAX_RETRY_DELAY_MS);
+    // Sleeping and then aborting the retry immediately would burn the rest of
+    // the budget for nothing, so give up the retry here and let the 429 stand
+    // as the leg's answer.
+    if (legDeadline - Date.now() < delay + MIN_ATTEMPT_MS) {
+      console.warn(
+        '[openrouter] 429 from ' + model + ', but only ' + Math.max(0, legDeadline - Date.now()) +
+          'ms of the leg budget is left (needs ' + (delay + MIN_ATTEMPT_MS) +
+          'ms to retry) — giving up'
+      );
+      break;
+    }
+    console.warn(
+      '[openrouter] 429 from ' + model + ', retrying in ' + delay +
+        'ms (attempt ' + (attempt + 1) + ')'
+    );
+    await res.body?.cancel();
+    await sleep(delay);
   }
 
   if (!res.ok) {
@@ -564,16 +556,17 @@ async function callOpenRouter(prompt, { json = true, timeoutMs = PRIMARY_TIMEOUT
 /**
  * Parse a free-form Thai message into
  * { title, deadlineIso (UTC | null), category, recurring }.
- * The configured OpenRouter model (mercury-2.5 by default) is primary, Gemini
- * is the fallback. The fallback trigger is deliberately broad: a hosted model
- * can be rate-limited, deprecated or capacity-starved without notice — the
- * 2026-09-21 `:free`-tier starvation is exactly that — so we cannot assume it
- * only fails as a 429. ANY ParseError out of the
- * OpenRouter leg — 429, other 4xx/5xx, network, unusable JSON — re-runs the same
- * prompt through Gemini, which at least has a response schema to lean on.
- * The two exceptions:
- *   - a missing OPENROUTER_API_KEY is a config problem Gemini cannot fix, so it
- *     surfaces directly (guard clause below, outside the try);
+ * The configured OpenRouter model (mercury-2.5 by default) is primary and
+ * OPENROUTER_FALLBACK_MODEL (qwen3-30b-a3b-instruct-2507 by default) is the
+ * fallback — same provider, same key, different model. The fallback trigger is
+ * deliberately broad: a hosted model can be rate-limited, deprecated or
+ * capacity-starved without notice — the 2026-09-21 `:free`-tier starvation is
+ * exactly that — so we cannot assume it only fails as a 429. ANY ParseError out
+ * of the primary leg — 429, other 4xx/5xx, network, unusable JSON — re-runs the
+ * same prompt through the fallback model. The two exceptions:
+ *   - a missing OPENROUTER_API_KEY is a config problem no model can fix, and it
+ *     now disables BOTH legs, so it surfaces directly (guard clause below,
+ *     outside the try);
  *   - 'low_confidence' is a verdict about the user's text, not a provider
  *     failure — a second opinion would just double the cost of every chit-chat
  *     message, so it surfaces as-is.
@@ -584,8 +577,11 @@ function isKeyMissing(key) {
 }
 
 /**
- * Run one prompt through OpenRouter, falling back to Gemini, and hand the raw
- * response text to `finalize`. All three callers share this so the
+ * Run one prompt through the primary OpenRouter model, falling back to the
+ * fallback OpenRouter model, and hand the raw response text to `finalize`.
+ * Both legs go through the same callOpenRouter client, so the response
+ * extraction and error mapping cannot drift between them. All three callers
+ * share this so the
  * retry/timeout, fallback-trigger and key-guard rules can never drift apart
  * between them. The two legs run SEQUENTIALLY in the failure case, which is why
  * their budgets are sized as a pair — see the note at the top of this file.
@@ -613,7 +609,15 @@ async function runWithFallback({ label, prompt, finalize, json, deadline }) {
 
   try {
     const result = finalize(
-      await callOpenRouter(prompt, { json, timeoutMs: primaryMs }),
+      await callOpenRouter(prompt, {
+        json,
+        timeoutMs: primaryMs,
+        model: config.openrouter.model,
+        // No retries on the primary: the fallback leg IS its retry, and a
+        // backoff sleep here would only delay reaching it.
+        retries: 0,
+        disableReasoning: config.openrouter.disableReasoning,
+      }),
       config.openrouter.model
     );
     console.info('[' + label + '] served by openrouter (primary) (' + config.openrouter.model + ')');
@@ -621,17 +625,18 @@ async function runWithFallback({ label, prompt, finalize, json, deadline }) {
   } catch (err) {
     const recoverable = err instanceof ParseError && err.code !== 'low_confidence';
     if (!recoverable) throw err;
-    if (isKeyMissing(config.gemini.apiKey)) {
-      console.warn(
-        '[' + label + '] openrouter (' + config.openrouter.model + ') failed (' + err.code + ') and no GEMINI_API_KEY — giving up'
-      );
-      throw err;
-    }
+    // There is deliberately no second key check here. The fallback used to be a
+    // different provider with its own GEMINI_API_KEY, so it needed its own
+    // "is the fallback even configured?" guard. Both legs now run on
+    // OPENROUTER_API_KEY, which the guard at the top of this function has
+    // already asserted — a second check could only ever be redundant, and
+    // checking the OLD key would have disabled a fallback that no longer
+    // depends on it.
     const fallbackMs = remainingMs(FALLBACK_TIMEOUT_MS, deadline);
     if (fallbackMs < MIN_ATTEMPT_MS) {
       console.warn(
         '[' + label + '] openrouter (' + config.openrouter.model + ') failed (' + err.code +
-          ') but the event budget is spent — skipping the ' + config.gemini.model + ' fallback'
+          ') but the event budget is spent — skipping the ' + config.openrouter.fallbackModel + ' fallback'
       );
       throw new ParseError(
         'No event budget left for the fallback leg (' + label + ')',
@@ -639,14 +644,27 @@ async function runWithFallback({ label, prompt, finalize, json, deadline }) {
       );
     }
     console.warn(
-      '[' + label + '] openrouter (' + config.openrouter.model + ') failed (' + err.code + '), falling back to ' + config.gemini.model +
-        ' (up to ' + fallbackMs + 'ms; this leg is itself flaky — HTTP 503 "overloaded" is common)'
+      '[' + label + '] openrouter (' + config.openrouter.model + ') failed (' + err.code +
+        '), falling back to ' + config.openrouter.fallbackModel + ' (up to ' + fallbackMs + 'ms)'
     );
     const result = finalize(
-      await callGemini(prompt, { json, timeoutMs: fallbackMs }),
-      config.gemini.model
+      await callOpenRouter(prompt, {
+        json,
+        timeoutMs: fallbackMs,
+        model: config.openrouter.fallbackModel,
+        // The only leg that retries — it is the last resort, so a transient 429
+        // must not end the chain. The budget above covers every attempt and
+        // every backoff sleep.
+        retries: MAX_429_RETRIES,
+        // Never on this leg — the model has no reasoning to disable and the
+        // flag can be answered with HTTP 400. See callOpenRouter.
+        disableReasoning: false,
+      }),
+      config.openrouter.fallbackModel
     );
-    console.debug('[' + label + '] served by gemini fallback (' + config.gemini.model + ')');
+    console.debug(
+      '[' + label + '] served by openrouter fallback (' + config.openrouter.fallbackModel + ')'
+    );
     return result;
   }
 }
